@@ -19,3 +19,14 @@ adb -e shell am start -n com.euhack.hello/.MainActivity
 ```
 
 Replace `igcap` with an AVD shown by `emulator -list-avds`.
+
+## Run on a USB phone
+
+```bash
+./gradlew assembleDebug
+adb -d install -r app/build/outputs/apk/debug/app-debug.apk
+adb -d shell am start -n com.euhack.hello/.MainActivity
+```
+
+The app is a dataset camera: press Start and it saves a photo every 5 s (countdown on screen) to
+`/sdcard/Android/data/com.euhack.hello/files/captures/session_<time>/`. See `ML/README.md` to pull and label them.
