@@ -18,9 +18,13 @@ import kotlin.math.sqrt
  *   module defects of PV plant combining the visible and infrared images", Solar Energy 236 (2022) 406-416,
  *   doi:10.1016/j.solener.2022.03.018.
  *
+ *  0. Latency (thermal packet arrival vs camera capture) from geometry-free signals: the hand's size in the
+ *     camera and the warm area in the thermal image rise and fall together as the hand moves nearer and
+ *     further, whatever the mounting; their cross-correlation peak is the lag. It has to be measured this
+ *     way: fitted together with the pose, a lag on a hand moving in circles is indistinguishable from a
+ *     roll of the sensor (a delayed circle is a rotated circle), which once gave roll 41 deg instead of 95.
  *  1. Global pose from points: hand centroid at its estimated depth (3D, camera) vs warm-blob centroid
- *     (2D, thermal); robust Levenberg-Marquardt from a grid of starting rotations, both mirror hypotheses;
- *     the thermal latency is chosen by the smallest reprojection error.
+ *     (2D, thermal); robust Levenberg-Marquardt from a grid of starting rotations, both mirror hypotheses.
  *  2. Silhouette refinement: Nelder-Mead on the correlation between each thermal pixel's predicted hand
  *     fraction (its rays intersected with the hand plane, looked up in the hand mask) and its warmth.
  * Both stages only accept physically possible rigs ([plausible]); that rules out the planar twin, which a
@@ -36,6 +40,15 @@ object ThermalCalibration {
     const val BLUR_PX = 0.8
     private const val PIXELS = ThermalGeometry.W * ThermalGeometry.H
     const val MAX_OFFSET_CM = 40.0
+    const val MAX_EDGE_FRACTION = 0.15
+    /** The capture needs the hand this much further away at its far end than at its near end (p90 / p10). */
+    const val MIN_DEPTH_SPREAD = 1.5
+    /** Thermal packet arrival after camera capture, measured on a recorded session (230 ms); used when the
+     *  capture has too little near/far motion to measure it. A property of firmware + USB, not of the mount. */
+    const val DEFAULT_LATENCY_MS = 225
+    private const val MIN_LATENCY_MS = 100     // >= one 125 ms subpage integration minus slack
+    private const val MAX_LATENCY_MS = 350
+    private const val MIN_LAG_CORRELATION = 0.6
     const val OFFSET_PRIOR_CM = 15.0
     const val LENS_PRIOR = 0.2
     private const val PRIOR_WEIGHT = 0.01
@@ -75,7 +88,7 @@ object ThermalCalibration {
     /** One analysed camera frame with a hand: mask in the model crop at 96x96, the crop box, depth, centroid. */
     class CameraSample(
         val tsNs: Long, val mask: FloatArray, val left: Int, val top: Int, val side: Int,
-        val depth: Double, val point: DoubleArray,
+        val depth: Double, val point: DoubleArray, val areaPx: Double,
     )
 
     class ThermalSample(val arrivalNs: Long, val celsius: FloatArray)
@@ -90,6 +103,7 @@ object ThermalCalibration {
         /** Rough 1-sigma: yaw, pitch, roll (rad), x, y, z (cm), focal scale. */
         val sigma: DoubleArray,
         val pairs: Int,
+        val latencyMeasured: Boolean = true,
     )
 
     /**
@@ -103,12 +117,21 @@ object ThermalCalibration {
         val areaPx = above.toDouble() / mask.size * side * side
         if (areaPx < 500) return null
         val small = downsample(mask, size, MASK_GRID)
+        // A hand cut off by the box edge has a too-small area, i.e. a too-large depth: skip those.
+        var edge = 0
+        for (k in 0 until MASK_GRID) {
+            if (small[k] > 0.5f) edge++
+            if (small[(MASK_GRID - 1) * MASK_GRID + k] > 0.5f) edge++
+            if (small[k * MASK_GRID] > 0.5f) edge++
+            if (small[k * MASK_GRID + MASK_GRID - 1] > 0.5f) edge++
+        }
+        if (edge > MAX_EDGE_FRACTION * 4 * MASK_GRID) return null
         val c = blobCentroid(small, MASK_GRID, MASK_GRID, 0.5f) ?: return null
         val z = cam.f * sqrt(HAND_AREA_CM2 / areaPx)
         val px = left + (c[0] + 0.5) / MASK_GRID * side
         val py = top + (c[1] + 0.5) / MASK_GRID * side
         return CameraSample(tsNs, small, left, top, side, z,
-            doubleArrayOf((px - cam.cx) / cam.f * z, (py - cam.cy) / cam.f * z, z))
+            doubleArrayOf((px - cam.cx) / cam.f * z, (py - cam.cy) / cam.f * z, z), areaPx)
     }
 
     /** Area-average [size]^2 -> [grid]^2 (size must be a multiple of grid). */
@@ -201,6 +224,58 @@ object ThermalCalibration {
             out.add(Pair(sortedCams[i], warm, c))
         }
         return out
+    }
+
+    // ------------------------------------------------------------------------------------------ stage 0
+
+    /** Hand size (camera) vs warm area (thermal) cross-correlation peak, or null if too weak to trust. */
+    fun estimateLatency(cams: List<CameraSample>, thermals: List<ThermalSample>): kotlin.Pair<Int, Double>? {
+        if (cams.size < 10 || thermals.size < 10) return null
+        val c = cams.sortedBy { it.tsNs }
+        val t = thermals.sortedBy { it.arrivalNs }
+        val cx = c.map { it.tsNs.toDouble() }.toDoubleArray()
+        val cy = c.map { it.areaPx }.toDoubleArray()
+        val tx = t.map { it.arrivalNs.toDouble() }.toDoubleArray()
+        val ty = t.map { s ->
+            val sorted = s.celsius.sortedArray()
+            val lo = percentile(sorted, 20.0)
+            s.celsius.count { it - lo > MIN_CONTRAST_C }.toDouble()
+        }.toDoubleArray()
+        val grid = generateSequence(cx.first()) { it + 20e6 }.takeWhile { it <= cx.last() }.toList()
+        if (grid.size < 20) return null
+        val a = grid.map { interp(it, cx, cy) }
+        var best = -1.0
+        var bestLag = 0
+        for (lag in MIN_LATENCY_MS..MAX_LATENCY_MS step 10) {
+            val b = grid.map { interp(it + lag * 1e6, tx, ty) }
+            val c0 = pearson(a, b)
+            if (c0 > best) {
+                best = c0; bestLag = lag
+            }
+        }
+        return if (best >= MIN_LAG_CORRELATION) kotlin.Pair(bestLag, best) else null
+    }
+
+    private fun interp(x: Double, xs: DoubleArray, ys: DoubleArray): Double {
+        if (x <= xs[0]) return ys[0]
+        if (x >= xs[xs.size - 1]) return ys[ys.size - 1]
+        var i = java.util.Arrays.binarySearch(xs, x)
+        if (i >= 0) return ys[i]
+        i = -i - 1
+        val f = (x - xs[i - 1]) / (xs[i] - xs[i - 1])
+        return ys[i - 1] * (1 - f) + ys[i] * f
+    }
+
+    private fun pearson(a: List<Double>, b: List<Double>): Double {
+        val ma = a.average()
+        val mb = b.average()
+        var sab = 0.0; var saa = 0.0; var sbb = 0.0
+        for (i in a.indices) {
+            val da = a[i] - ma
+            val db = b[i] - mb
+            sab += da * db; saa += da * da; sbb += db * db
+        }
+        return if (saa > 0 && sbb > 0) sab / sqrt(saa * sbb) else 0.0
     }
 
     // ------------------------------------------------------------------------------------------ stage 1
@@ -328,6 +403,17 @@ object ThermalCalibration {
             }
         bestX[2] = wrapAngle(bestX[2])
         return Triple(bestX + 0.0, bestMirror, medianReprojection(bestX, bestMirror, pairs))
+    }
+
+    /** Same rotation, reported with |pitch| <= 90 deg: (yaw, pitch, roll) == (yaw+180, 180-pitch, roll+180). */
+    fun canonicalize(p: DoubleArray) {
+        p[1] = wrapAngle(p[1])
+        if (abs(p[1]) > Math.PI / 2) {
+            p[0] += Math.PI
+            p[1] = Math.PI - p[1]
+            p[2] += Math.PI
+        }
+        for (i in 0..2) p[i] = wrapAngle(p[i])
     }
 
     private fun wrapAngle(a: Double): Double {
@@ -513,33 +599,17 @@ object ThermalCalibration {
      */
     fun solve(cams: List<CameraSample>, thermals: List<ThermalSample>, cam: CameraIntrinsics,
               maxIter: Int = 800, progress: (Double) -> Unit = {}): Result? {
-        // Stage 1: full multi-start at the latency that pairs the most frames, then re-fit at each latency
-        // from that pose and keep the one with the smallest reprojection error.
-        val latencies = (0..400 step 50).toList()
-        val counts = latencies.associateWith { makePairs(cams, thermals, it).size }
-        val seedLatency = latencies.maxWith(compareBy<Int> { counts[it]!! }.thenBy { -abs(it - 200) })
-        val seedPairs = makePairs(cams, thermals, seedLatency)
-        if (seedPairs.size < MIN_PAIRS) return null
-        val (x0, mirror, _) = poseFromPoints(seedPairs.every(120))
-        progress(0.3)
-        var bestLatency = seedLatency
-        var bestErr = Double.POSITIVE_INFINITY
-        var bestX = x0
-        for (lat in latencies) {
-            val pr = makePairs(cams, thermals, lat).every(120)
-            if (pr.size < MIN_PAIRS) continue
-            val (x, _) = levenbergMarquardt(x0.copyOf(6), mirror, pr, 60)
-            if (!plausible(x + 0.0, nearDepth(pr))) continue
-            val err = medianReprojection(x, mirror, pr)
-            if (err < bestErr) {
-                bestErr = err; bestLatency = lat; bestX = x
-            }
-        }
+        // Stage 0: latency from geometry-free signals (see the class comment for why not from the fit).
+        val measured = estimateLatency(cams, thermals)
+        val latency = measured?.first ?: DEFAULT_LATENCY_MS
+        val pairs = makePairs(cams, thermals, latency)
+        if (pairs.size < MIN_PAIRS) return null
+        // Stage 1: pose from points, multi-start.
+        val (x1, mirror, stage1Err) = poseFromPoints(pairs.every(120))
         progress(0.4)
-        val pairs = makePairs(cams, thermals, bestLatency)
         val fitSet = pairs.every(200)
         val near = nearDepth(pairs)
-        val p1 = doubleArrayOf(bestX[0], bestX[1], wrapAngle(bestX[2]), bestX[3], bestX[4], bestX[5], 0.0)
+        val p1 = doubleArrayOf(x1[0], x1[1], wrapAngle(x1[2]), x1[3], x1[4], x1[5], 0.0)
 
         // Stage 2: maximise silhouette correlation.
         var evals = 0
@@ -551,9 +621,48 @@ object ThermalCalibration {
         }, p1, step, maxIter)
         val sigma = sensitivity(p, mirror, fitSet, cam)
         progress(1.0)
-        p[2] = wrapAngle(p[2])
-        return Result(ThermalPose.of(p, mirror), bestLatency, correlation(p, mirror, pairs, cam), bestErr, sigma, pairs.size)
+        canonicalize(p)
+        return Result(ThermalPose.of(p, mirror), latency, correlation(p, mirror, pairs, cam), stage1Err, sigma, pairs.size,
+            latencyMeasured = measured != null)
     }
 
     const val MIN_PAIRS = 12
+
+    /** Saves a capture (for replaying it offline: ThermalCalibrationTest picks up ML/data/calibrations/). */
+    fun writeCapture(file: java.io.File, cams: List<CameraSample>, thermals: List<ThermalSample>, cam: CameraIntrinsics) {
+        java.io.DataOutputStream(java.io.BufferedOutputStream(java.io.FileOutputStream(file))).use { o ->
+            o.writeInt(CAPTURE_VERSION)
+            o.writeDouble(cam.f); o.writeDouble(cam.cx); o.writeDouble(cam.cy)
+            o.writeInt(cams.size)
+            for (c in cams) {
+                o.writeLong(c.tsNs); o.writeInt(c.left); o.writeInt(c.top); o.writeInt(c.side)
+                o.writeDouble(c.depth); for (v in c.point) o.writeDouble(v); o.writeDouble(c.areaPx)
+                for (v in c.mask) o.writeByte((v.coerceIn(0f, 1f) * 255).toInt())
+            }
+            o.writeInt(thermals.size)
+            for (t in thermals) {
+                o.writeLong(t.arrivalNs)
+                for (v in t.celsius) o.writeFloat(v)
+            }
+        }
+    }
+
+    fun readCapture(file: java.io.File): Triple<List<CameraSample>, List<ThermalSample>, CameraIntrinsics> {
+        java.io.DataInputStream(java.io.BufferedInputStream(java.io.FileInputStream(file))).use { i ->
+            require(i.readInt() == CAPTURE_VERSION)
+            val cam = CameraIntrinsics(i.readDouble(), i.readDouble(), i.readDouble())
+            val cams = List(i.readInt()) {
+                val ts = i.readLong(); val l = i.readInt(); val t = i.readInt(); val sd = i.readInt()
+                val depth = i.readDouble()
+                val point = DoubleArray(3) { i.readDouble() }
+                val area = i.readDouble()
+                val mask = FloatArray(MASK_GRID * MASK_GRID) { (i.readUnsignedByte()) / 255f }
+                CameraSample(ts, mask, l, t, sd, depth, point, area)
+            }
+            val thermals = List(i.readInt()) { ThermalSample(i.readLong(), FloatArray(PIXELS) { i.readFloat() }) }
+            return Triple(cams, thermals, cam)
+        }
+    }
+
+    private const val CAPTURE_VERSION = 1
 }

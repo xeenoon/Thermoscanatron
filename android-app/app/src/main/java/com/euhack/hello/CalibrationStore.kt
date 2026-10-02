@@ -18,6 +18,7 @@ class CalibrationStore(dir: File) {
                 ThermalPose.of(DoubleArray(7) { p.getDouble(it) }, o.getBoolean("mirror")),
                 o.getInt("latency_ms"), o.getDouble("correlation"), o.getDouble("stage1_px"),
                 DoubleArray(7) { s.optDouble(it, Double.NaN) }, o.getInt("pairs"),
+                o.optBoolean("latency_measured", true),
             )
         }
     } catch (e: Exception) {
@@ -34,6 +35,7 @@ class CalibrationStore(dir: File) {
             .put("stage1_px", r.stage1Px)
             .put("sigma", JSONArray(r.sigma.map { if (it.isFinite()) it else JSONObject.NULL }))
             .put("pairs", r.pairs)
+            .put("latency_measured", r.latencyMeasured)
             .put("readable", describe(r))
             .toString(2))
     }
@@ -57,7 +59,7 @@ class CalibrationStore(dir: File) {
                 |Z (forward)          ${cm(5)}
                 |
                 |Mirrored sensor: ${if (r.pose.mirror) "yes" else "no"}   lens scale ${String.format(Locale.US, "%.2f", Math.exp(p[6]))}
-                |Fit: correlation ${String.format(Locale.US, "%.2f", r.correlation)} over ${r.pairs} frames, thermal lag ${r.latencyMs} ms
+                |Fit: correlation ${String.format(Locale.US, "%.2f", r.correlation)} over ${r.pairs} frames, thermal lag ${r.latencyMs} ms${if (r.latencyMeasured) "" else " (default)"}
             """.trimMargin()
         }
     }

@@ -115,6 +115,7 @@ class DemoActivity : ComponentActivity() {
     private val fusion = FusionRenderer()
     private val fusionExecutor = Executors.newSingleThreadExecutor()
     private val fusionBusy = AtomicBoolean(false)
+    private var handDepthCm = Double.NaN      // analysis thread
     /** Phone camera focal length in sensor (active array) pixels, from Camera2; 0 until bound. */
     @Volatile private var sensorFocalPx = 0.0
 
@@ -380,10 +381,10 @@ class DemoActivity : ComponentActivity() {
         // Parallax separates tilt from offset, so the capture also needs the hand near and far: after 5 s it
         // keeps going until the depth spread is there (or 15 s have passed).
         val spread = ThermalCalibration.depthSpread(calibCams)
-        val needDepth = calibHandMs >= CALIBRATION_MS && spread < MIN_DEPTH_SPREAD
+        val needDepth = calibHandMs >= CALIBRATION_MS && spread < ThermalCalibration.MIN_DEPTH_SPREAD
         calibNeedsDepth = needDepth
         val progress = if (!needDepth) (calibHandMs * 1000 / CALIBRATION_MS).toInt().coerceAtMost(1000)
-            else (900 + 100 * (spread - 1) / (MIN_DEPTH_SPREAD - 1)).toInt().coerceAtMost(999)
+            else (900 + 100 * (spread - 1) / (ThermalCalibration.MIN_DEPTH_SPREAD - 1)).toInt().coerceAtMost(999)
         runOnUiThread { calibProgress.progress = progress }
         if (calibHandMs >= CALIBRATION_MS && (!needDepth || calibHandMs >= MAX_CALIBRATION_MS)) {
             calibState = CalibState.SOLVING
@@ -399,6 +400,13 @@ class DemoActivity : ComponentActivity() {
         collectThermal = false
         val thermals = calibThermals.toList()
         val camera = cams.firstOrNull()?.let { intrinsicsForCalibration } ?: return finishCalibration(null)
+        try {
+            val dir = File(getExternalFilesDir(null), "calibrations").apply { mkdirs() }
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            ThermalCalibration.writeCapture(File(dir, "capture_$stamp.bin"), cams, thermals, camera)
+        } catch (e: Exception) {
+            Log.w(TAG, "could not save the calibration capture", e)
+        }
         val result = try {
             ThermalCalibration.solve(cams, thermals, camera) { p ->
                 runOnUiThread { calibProgress.progress = (p * 1000).toInt() }
@@ -502,17 +510,21 @@ class DemoActivity : ComponentActivity() {
         val cal = calibration ?: return
         val thermalFrame = latestThermal ?: return
         if (!fusionBusy.compareAndSet(false, true)) return
-        var depth = FusionRenderer.DEFAULT_DEPTH_CM
         var hand: FloatArray? = null
         if (handVisible) {
             var above = 0
             for (p in mask) if (p > 0.5f) above++
             val areaPx = above.toDouble() / mask.size * side * side
             if (areaPx > 500) {
-                depth = cam.f * sqrt(ThermalCalibration.HAND_AREA_CM2 / areaPx)
+                // The area-based depth jitters frame to frame; smooth it so the hand mapping does not wobble.
+                val d = cam.f * sqrt(ThermalCalibration.HAND_AREA_CM2 / areaPx)
+                handDepthCm = if (handDepthCm.isNaN()) d else handDepthCm + 0.3 * (d - handDepthCm)
                 hand = mask.copyOf()
             }
+        } else {
+            handDepthCm = Double.NaN
         }
+        val depth = if (hand != null) handDepthCm else null
         fusionExecutor.execute {
             try {
                 val st = fusion.render(frame, thermalFrame, cal.pose, cam, depth, hand, SIZE, left, top, side)
@@ -844,8 +856,7 @@ class DemoActivity : ComponentActivity() {
         private const val MENU_FUSED = 5
         private const val CALIBRATION_MS = 5000L
         private const val MAX_CALIBRATION_MS = 15000L
-        private const val MIN_DEPTH_SPREAD = 1.35
-        private const val DEPTH_PROMPT = "Almost there: move your hand closer to the phone, then further away"
+        private const val DEPTH_PROMPT = "Almost there: bring your hand close to the phone (~15 cm), then out to arm's length"
         private const val VETO_GRID = 24
         private const val VETO_DELTA_C = 2.5f
         private const val CALIBRATE_PROMPT = "Hold your hand up inside the box to calibrate\n" +

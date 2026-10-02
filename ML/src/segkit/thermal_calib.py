@@ -20,10 +20,14 @@ Model
   hand          per frame, a plane at depth Z estimated from the mask area (open hand ~HAND_AREA_CM2).
 
 Nothing about the mounting is assumed: any roll, large yaw/pitch, tens of cm of offset, mirrored or not.
+  0. Latency (thermal arrival after camera capture) from geometry-free signals: hand size in the camera and
+     warm area in the thermal image rise and fall together as the hand moves nearer/further, whatever the
+     mounting; the cross-correlation peak (100-350 ms) is the lag, else DEFAULT_LATENCY_MS. Fitting it with
+     the pose instead lets a lag on a circling hand pose as a roll (a delayed circle is a rotated circle).
   1. Global pose from points: per frame, the camera hand centroid at depth Z is a 3D point and the warm-blob
      centroid is its thermal image. Pose from those 3D-2D pairs is solved by robust Levenberg-Marquardt
      from a grid of starting rotations (all rolls, yaw/pitch +-60 deg), for both mirror hypotheses.
-     The thermal-vs-camera latency is picked the same way (lowest robust reprojection error).
+     Hands cut off by the crop box are skipped (their area, hence depth, is wrong).
   2. Silhouette refinement: for every thermal pixel (2x2 sub-rays, blurred by the optics' PSF) the ray is
      intersected with the hand plane and looked up in the camera's hand mask, predicting its "hand
      fraction"; pose + focal scale are tuned to maximise the correlation with the pixel warmth.
@@ -65,6 +69,8 @@ HAND_AREA_CM2 = 130.0                   # silhouette area of an open adult hand,
 MASK_GRID = 96                          # crop mask resolution used for fitting (384 / 4)
 RECORD_BYTES = 8 + 1566                 # thermal.bin record: int64 arrival ns + THM2 packet
 MIN_CONTRAST_C = 4.0                    # thermal frames flatter than this hold no hand
+MAX_EDGE_FRACTION = 0.15                # hand cut off by the crop box: area (and depth) unreliable
+DEFAULT_LATENCY_MS = 225                # measured on the first recorded session (firmware + USB property)
 SUB = np.array([[-0.25, -0.25], [0.25, -0.25], [-0.25, 0.25], [0.25, 0.25]])
 MAX_OFFSET_CM = 40.0                    # thermal camera within this distance of the phone lens
 MIN_AXIS_COS = np.cos(np.radians(80))   # both cameras face the same way
@@ -172,6 +178,9 @@ def make_pairs(s: Session, dt_ms: float, t_ranges: list[tuple[float, float]] | N
             continue
         m = cv2.imread(str(s.dir / "masks" / f"{i:06d}.png"), cv2.IMREAD_GRAYSCALE)
         m = cv2.resize(m, (MASK_GRID, MASK_GRID), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
+        border = np.concatenate([m[0], m[-1], m[:, 0], m[:, -1]]) > 0.5
+        if border.sum() > MAX_EDGE_FRACTION * 4 * MASK_GRID:
+            continue
         mc, tc = blob_centroid(m, 0.5), blob_centroid(w, 0.5)
         if mc is None or tc is None:
             continue
@@ -197,6 +206,17 @@ def rotation(yaw: float, pitch: float, roll: float) -> np.ndarray:
     rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
     rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
     return ry @ rx @ rz
+
+
+def canonical(p: np.ndarray) -> np.ndarray:
+    """Same rotation, reported with |pitch| <= 90 deg: (yaw, pitch, roll) == (yaw+180, 180-pitch, roll+180)."""
+    q = np.array(p, float)
+    wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
+    q[1] = wrap(q[1])
+    if abs(q[1]) > np.pi / 2:
+        q[0], q[1], q[2] = q[0] + np.pi, np.pi - q[1], q[2] + np.pi
+    q[:3] = [wrap(a) for a in q[:3]]
+    return q
 
 
 def project_thermal(pts: np.ndarray, p: np.ndarray, mirror: bool) -> np.ndarray:
@@ -309,20 +329,40 @@ def sensitivity(p, mirror, s, pairs) -> np.ndarray:
     return np.array(out)
 
 
+# ---------------------------------------------------------------------------------------------- stage 0
+
+def estimate_latency(s: Session, t_ranges) -> int | None:
+    """Hand size (camera) vs warm area (thermal) cross-correlation peak in 100-350 ms, if >= 0.6."""
+    t0 = s.cam_ts[0]
+    keep = [i for i, r in enumerate(s.rows) if r["hand_visible"] == "1"
+            and (not t_ranges or any(a <= (s.cam_ts[i] - t0) / 1e9 < b for a, b in t_ranges))]
+    if len(keep) < 10:
+        return None
+    ts = s.cam_ts[keep]
+    area = np.array([float(s.rows[i]["mask_frac"]) * int(s.rows[i]["box_side"]) ** 2 for i in keep])
+    warm = np.array([(t - np.percentile(t, 20) > MIN_CONTRAST_C).sum() for t in s.temps], float)
+    grid = np.arange(ts[0], ts[-1], 20e6)
+    a = np.interp(grid, ts, area)
+    a -= a.mean()
+    best, lag = -1.0, None
+    for dt in range(100, 351, 10):
+        b = np.interp(grid + dt * 1e6, s.t_ns, warm)
+        b -= b.mean()
+        c = (a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum() + 1e-12)
+        if c > best:
+            best, lag = c, dt
+    print(f"latency from hand size: {lag} ms (correlation {best:.2f})")
+    return lag if best >= 0.6 else None
+
+
 # ---------------------------------------------------------------------------------------------- driver
 
 def fit(session: Path, t_ranges, out_dir: Path) -> dict:
     s = load(session)
 
-    # Stage 1 at a few latencies; keep the latency with the smallest reprojection error.
-    stage1 = {}
-    for dt in range(0, 401, 50):
-        pr = make_pairs(s, float(dt), t_ranges)
-        stage1[dt] = (*pose_from_points(pr.every(len(pr.depth) // 120)), pr)
-        print(f"  latency {dt:3d} ms: {len(pr.depth)} pairs, mirror={stage1[dt][1]}, "
-              f"median reprojection {stage1[dt][2]:.2f} px")
-    dt_ms = min(stage1, key=lambda d: stage1[d][2])
-    p1, mirror, err1, pairs = stage1[dt_ms]
+    dt_ms = estimate_latency(s, t_ranges) or DEFAULT_LATENCY_MS
+    pairs = make_pairs(s, float(dt_ms), t_ranges)
+    p1, mirror, err1 = pose_from_points(pairs.every(len(pairs.depth) // 120))
     print(f"stage 1: latency {dt_ms} ms  mirror={mirror}  yaw/pitch/roll "
           f"{np.degrees(p1[:3]).round(1)} deg  xyz {p1[3:6].round(1)} cm  ({err1:.2f} px)")
     print(f"hand depth median {np.median(pairs.depth):.0f} cm (p10 {np.percentile(pairs.depth, 10):.0f}, "
@@ -330,7 +370,7 @@ def fit(session: Path, t_ranges, out_dir: Path) -> dict:
 
     fit_set = pairs.every(len(pairs.depth) // 200)
     c1 = correlation(p1, mirror, s, fit_set)
-    p = refine(p1, mirror, s, fit_set)
+    p = canonical(refine(p1, mirror, s, fit_set))
     err = sensitivity(p, mirror, s, fit_set)
     corr = correlation(p, mirror, s, pairs)
     k = float(np.exp(p[6]))

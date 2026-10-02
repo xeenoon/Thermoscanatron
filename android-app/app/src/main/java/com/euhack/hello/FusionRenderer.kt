@@ -8,8 +8,11 @@ import kotlin.math.sqrt
 
 /**
  * Camera + thermal fusion for the calibrated rig. Every camera pixel is mapped into the thermal image
- * through the calibration ([ThermalPose], at the depth of the hand, or a default scene depth); pixels the
- * thermal camera does not see are black. The 32x24 temperatures are upsampled to camera resolution with a
+ * through the calibration ([ThermalPose]); pixels the thermal camera does not see are black, with the border
+ * feathered over [FEATHER_PX] thermal pixels. The two cameras sit a few cm apart, so where a camera pixel
+ * lands in the thermal image depends on how far away that point is (parallax: a 4 cm offset is ~9 deg at a
+ * 25 cm hand, ~2 deg at 1 m). Depth per pixel is unknown, so hand pixels are mapped at the hand's depth and
+ * everything else at a fixed scene depth: the overlap stays put and the hand still lines up. The 32x24 temperatures are upsampled to camera resolution with a
  * guided filter that uses the camera image as the guide, so temperature edges snap to the object edges the
  * phone sees:
  *   K. He, J. Sun, X. Tang, "Guided Image Filtering", IEEE TPAMI 35(6) (2013) 1397-1409,
@@ -33,10 +36,37 @@ class FusionRenderer(val width: Int = 240, val height: Int = 320) {
     private val mapU = FloatArray(n)
     private val mapV = FloatArray(n)
     private val inside = BooleanArray(n)
-    private var mapPose: ThermalPose? = null
-    private var mapDepth = 0.0
-    private var mapFrameW = 0
-    private var mapFrameH = 0
+    private val alpha = FloatArray(n)
+    private val sceneMap = DepthMap()
+    private val handMap = DepthMap()
+
+    /** Camera pixel -> thermal pixel for points at one depth; recomputed only when pose, frame or depth (>10%) change. */
+    private inner class DepthMap {
+        val u = FloatArray(n)
+        val v = FloatArray(n)
+        private var pose: ThermalPose? = null
+        private var depth = 0.0
+        private var frameW = 0
+        private var frameH = 0
+
+        fun update(pose: ThermalPose, cam: CameraIntrinsics, depthCm: Double, fw: Int, fh: Int) {
+            if (pose === this.pose && fw == frameW && fh == frameH && abs(ln(depthCm / depth)) < 0.1) return
+            val sx = fw.toDouble() / width
+            val sy = fh.toDouble() / height
+            val uv = DoubleArray(2)
+            for (y in 0 until height) for (x in 0 until width) {
+                val fx = (x + 0.5) * sx - 0.5
+                val fy = (y + 0.5) * sy - 0.5
+                pose.project((fx - cam.cx) / cam.f * depthCm, (fy - cam.cy) / cam.f * depthCm, depthCm, uv)
+                u[y * width + x] = uv[0].toFloat()
+                v[y * width + x] = uv[1].toFloat()
+            }
+            this.pose = pose
+            depth = depthCm
+            frameW = fw
+            frameH = fh
+        }
+    }
 
     private val rgb = IntArray(n)
     private val guide = FloatArray(n)
@@ -100,11 +130,32 @@ class FusionRenderer(val width: Int = 240, val height: Int = 320) {
 
     /**
      * [frame] is the upright camera frame; [hand] (optional) the model's hand probabilities over the crop
-     * box ([maskSize]^2 at [left], [top], [side] in frame pixels). [depthCm] is where the mapping is exact.
+     * box ([maskSize]^2 at [left], [top], [side] in frame pixels), at [handDepthCm].
      */
-    fun render(frame: Bitmap, thermal: ThermalFrame, pose: ThermalPose, cam: CameraIntrinsics, depthCm: Double,
-               hand: FloatArray?, maskSize: Int, left: Int, top: Int, side: Int): Stats {
-        updateMap(pose, cam, depthCm, frame.width, frame.height)
+    fun render(frame: Bitmap, thermal: ThermalFrame, pose: ThermalPose, cam: CameraIntrinsics,
+               handDepthCm: Double?, hand: FloatArray?, maskSize: Int, left: Int, top: Int, side: Int): Stats {
+        sceneMap.update(pose, cam, DEFAULT_DEPTH_CM, frame.width, frame.height)
+        val useHand = hand != null && handDepthCm != null && side > 0
+        if (useHand) handMap.update(pose, cam, handDepthCm!!, frame.width, frame.height)
+        val fsx = frame.width.toFloat() / width
+        val fsy = frame.height.toFloat() / height
+        for (y in 0 until height) for (x in 0 until width) {
+            val i = y * width + x
+            var onHand = false
+            if (useHand) {
+                val mx = (((x + 0.5f) * fsx - left) / side * maskSize).toInt()
+                val my = (((y + 0.5f) * fsy - top) / side * maskSize).toInt()
+                onHand = mx in 0 until maskSize && my in 0 until maskSize && hand!![my * maskSize + mx] > 0.3f
+            }
+            val m = if (onHand) handMap else sceneMap
+            val u = m.u[i]
+            val v = m.v[i]
+            mapU[i] = u
+            mapV[i] = v
+            val margin = minOf(minOf(u + 0.5f, ThermalGeometry.W - 0.5f - u), minOf(v + 0.5f, ThermalGeometry.H - 0.5f - v))
+            alpha[i] = (margin / FEATHER_PX).coerceIn(0f, 1f)
+            inside[i] = alpha[i] > 0f
+        }
         updateThermal(thermal)
         Bitmap.createScaledBitmap(frame, width, height, true).getPixels(rgb, 0, width, 0, 0, width, height)
 
@@ -151,31 +202,11 @@ class FusionRenderer(val width: Int = 240, val height: Int = 320) {
             val r = (((base shr 16) and 0xFF) * 0.85f + cam255).coerceAtMost(255f) * (1 - e) + 255 * e
             val g = (((base shr 8) and 0xFF) * 0.85f + cam255).coerceAtMost(255f) * (1 - e) + 255 * e
             val bl = ((base and 0xFF) * 0.85f + cam255).coerceAtMost(255f) * (1 - e) + 255 * e
-            out[i] = Color.rgb(r.toInt(), g.toInt(), bl.toInt())
+            val k = alpha[i]
+            out[i] = Color.rgb((r * k).toInt(), (g * k).toInt(), (bl * k).toInt())
         }
         synchronized(bitmap) { bitmap.setPixels(out, 0, width, 0, 0, width, height) }
         return Stats(lo, hi, handC, seen.toFloat() / n)
-    }
-
-    /** Camera pixel -> thermal pixel, recomputed only when the pose, frame size or depth (>10%) changes. */
-    private fun updateMap(pose: ThermalPose, cam: CameraIntrinsics, depthCm: Double, frameW: Int, frameH: Int) {
-        if (pose === mapPose && frameW == mapFrameW && frameH == mapFrameH && abs(ln(depthCm / mapDepth)) < 0.1) return
-        val sx = frameW.toDouble() / width
-        val sy = frameH.toDouble() / height
-        val uv = DoubleArray(2)
-        for (y in 0 until height) for (x in 0 until width) {
-            val fx = (x + 0.5) * sx - 0.5
-            val fy = (y + 0.5) * sy - 0.5
-            pose.project((fx - cam.cx) / cam.f * depthCm, (fy - cam.cy) / cam.f * depthCm, depthCm, uv)
-            val i = y * width + x
-            mapU[i] = uv[0].toFloat()
-            mapV[i] = uv[1].toFloat()
-            inside[i] = uv[0] >= -0.5 && uv[0] < ThermalGeometry.W - 0.5 && uv[1] >= -0.5 && uv[1] < ThermalGeometry.H - 0.5
-        }
-        mapPose = pose
-        mapDepth = depthCm
-        mapFrameW = frameW
-        mapFrameH = frameH
     }
 
     private fun sampleThermal(t: FloatArray, u: Float, v: Float): Float {
@@ -259,7 +290,10 @@ class FusionRenderer(val width: Int = 240, val height: Int = 320) {
          * noise into blotches shaped like the camera's edges; 0.01 keeps object edges without that.
          */
         const val EPS = 0.01f
+        /** Depth the non-hand scene is mapped at (where the overlap border is drawn). */
         const val DEFAULT_DEPTH_CM = 100.0
+        /** Border fade, in thermal pixels, instead of a hard staircase edge. */
+        const val FEATHER_PX = 0.5f
         const val MIN_SPAN_C = 5f            // narrowest colour range: ~10x the sensor's frame-to-frame noise
         const val FAST_DELTA_C = 1.5f        // larger changes are real (motion), follow them quickly
         const val RANGE_RATE = 0.25f         // colour range follows the scene over ~4 thermal frames

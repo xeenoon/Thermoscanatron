@@ -38,6 +38,13 @@ def synthetic(p_true: np.ndarray, mirror: bool, n: int = 90, seed: int = 0):
     return s, pairs.every(1) if not keep else tc.Pairs(*(a[keep] for a in vars(pairs).values()))
 
 
+def test_canonical_is_the_same_rotation():
+    p = np.array([*np.radians([176.5, 176.2, -85.1]), 0, 0, 0, 0])
+    q = tc.canonical(p)
+    assert abs(q[1]) <= np.pi / 2
+    assert np.allclose(tc.rotation(*p[:3]), tc.rotation(*q[:3]))
+
+
 @pytest.mark.parametrize("deg, cm, mirror", [
     ((-30, 5, 45), (20, -3, 1), True),     # 30 deg yaw, 45 deg roll, 20 cm to the side
     ((2, -3, 92), (0, 3.5, -1), True),     # close to the real phone mounting
@@ -49,7 +56,7 @@ def test_recovers_arbitrary_mounting(deg, cm, mirror):
     assert len(pairs.depth) > 30, "the synthetic thermal camera must see the hand in most frames"
     p1, m1, err = tc.pose_from_points(pairs)
     assert m1 == mirror
-    p = tc.refine(p1, m1, s, pairs)
+    p = tc.canonical(tc.refine(p1, m1, s, pairs))
     ang_err = np.degrees(np.abs((p[:3] - p_true[:3] + np.pi) % (2 * np.pi) - np.pi))
     assert ang_err.max() < 1.5, ang_err
     assert np.abs(p[3:6] - p_true[3:6]).max() < 1.5, p[3:6]
