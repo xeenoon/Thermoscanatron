@@ -1,0 +1,80 @@
+export const MAGIC = Buffer.from('THM1');
+export const VERSION = 1;
+export const HEADER_BYTES = 28;
+export const FRAME_WORDS = 834;
+export const WIDTH = 32;
+export const HEIGHT = 24;
+export const PIXEL_WORDS = WIDTH * HEIGHT;
+export const PAYLOAD_BYTES = FRAME_WORDS * 2;
+export const PACKET_BYTES = HEADER_BYTES + PAYLOAD_BYTES;
+
+export function crc32(data) {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+export function signedWord(word) {
+  return word > 0x7fff ? word - 0x10000 : word;
+}
+
+export function decodePacket(packet) {
+  if (packet.length !== PACKET_BYTES || !packet.subarray(0, 4).equals(MAGIC)) {
+    throw new Error('invalid packet boundary');
+  }
+
+  const version = packet.readUInt8(4);
+  const subpage = packet.readUInt8(5);
+  const headerBytes = packet.readUInt16LE(6);
+  const sequence = packet.readUInt32LE(8);
+  const timestampUs = packet.readBigUInt64LE(12);
+  const wordCount = packet.readUInt16LE(20);
+  const width = packet.readUInt8(22);
+  const height = packet.readUInt8(23);
+  const expectedCrc = packet.readUInt32LE(24);
+
+  if (version !== VERSION || headerBytes !== HEADER_BYTES || wordCount !== FRAME_WORDS) {
+    throw new Error('unsupported packet format');
+  }
+  if (width !== WIDTH || height !== HEIGHT || subpage > 1) {
+    throw new Error('invalid frame metadata');
+  }
+
+  const payload = packet.subarray(headerBytes);
+  const actualCrc = crc32(payload);
+  if (actualCrc !== expectedCrc) {
+    throw new Error('payload CRC mismatch');
+  }
+
+  const words = new Uint16Array(wordCount);
+  for (let index = 0; index < wordCount; index += 1) {
+    words[index] = payload.readUInt16LE(index * 2);
+  }
+
+  return { version, subpage, sequence, timestampUs, width, height, words };
+}
+
+export function encodePacket({ sequence, timestampUs, subpage, words }) {
+  if (words.length !== FRAME_WORDS) throw new Error(`expected ${FRAME_WORDS} words`);
+
+  const packet = Buffer.alloc(PACKET_BYTES);
+  MAGIC.copy(packet);
+  packet.writeUInt8(VERSION, 4);
+  packet.writeUInt8(subpage, 5);
+  packet.writeUInt16LE(HEADER_BYTES, 6);
+  packet.writeUInt32LE(sequence >>> 0, 8);
+  packet.writeBigUInt64LE(BigInt(timestampUs), 12);
+  packet.writeUInt16LE(FRAME_WORDS, 20);
+  packet.writeUInt8(WIDTH, 22);
+  packet.writeUInt8(HEIGHT, 23);
+  for (let index = 0; index < FRAME_WORDS; index += 1) {
+    packet.writeUInt16LE(words[index], HEADER_BYTES + index * 2);
+  }
+  packet.writeUInt32LE(crc32(packet.subarray(HEADER_BYTES)), 24);
+  return packet;
+}

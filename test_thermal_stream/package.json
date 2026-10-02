@@ -1,0 +1,24 @@
+{
+  "name": "test-thermal-stream",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Raw MLX90640 serial stream viewer for the QT Py ESP32-S3 firmware",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "simulate": "node src/server.js --simulate",
+    "list-ports": "node src/server.js --list",
+    "test": "node --test",
+    "validate": "node scripts/validate.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "serialport": "^13.0.0",
+    "ws": "^8.18.3"
+  },
+  "allowScripts": {
+    "@serialport/bindings-cpp@13.0.0": true
+  }
+}
