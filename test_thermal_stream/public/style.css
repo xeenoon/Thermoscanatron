@@ -6,3 +6,12 @@ canvas {
   height: min(100vh, calc(100vw * 3 / 4));
   background: #000;
 }
+#readout {
+  position: fixed;
+  top: 8px;
+  left: 12px;
+  margin: 0;
+  color: #fff;
+  font: 14px/1.4 ui-monospace, monospace;
+  text-shadow: 0 0 4px #000;
+}

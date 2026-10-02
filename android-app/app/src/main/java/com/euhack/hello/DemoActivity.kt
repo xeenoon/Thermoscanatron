@@ -8,6 +8,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.hardware.camera2.CameraCharacteristics
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -16,9 +18,14 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -26,18 +33,39 @@ import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Module
+import org.json.JSONArray
+import org.json.JSONObject
 import org.pytorch.executorch.Tensor
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 
 /**
  * Live hand demo: the centred square of the camera frame goes through HandSegNet (ExecuTorch, XNNPACK),
  * and the predicted outline is drawn in green over the preview when the model says a hand is present.
+ *
+ * The Options dropdown toggles:
+ *  - Record: silent 1080p dataset video to <external files>/videos/ (see ML/README.md), plus a
+ *    [SessionRecorder] session of every analysed camera frame and every thermal packet, time-stamped
+ *    on one clock, for fitting the camera-to-thermal alignment;
+ *  - Dump NO-HAND frames: [NoHandLogger] diagnostics;
+ *  - Stream thermal input: shows only the USB thermal camera ([ThermalUsbStream]) full screen. The camera
+ *    keeps running behind it so recording still captures both.
+ * Whenever the thermal camera is plugged in, a small live thermal view sits in the corner of the camera view.
  */
 class DemoActivity : ComponentActivity() {
     private lateinit var previewView: PreviewView
@@ -50,7 +78,21 @@ class DemoActivity : ComponentActivity() {
     private val pixels = IntArray(SIZE * SIZE)
     private var lastFrameMs = 0L
     private lateinit var logger: NoHandLogger
-    private lateinit var logButton: Button
+    private lateinit var thermalView: ThermalView
+    private lateinit var thermalInset: ThermalView
+    private lateinit var sessions: SessionRecorder
+    private lateinit var recordingLabel: TextView
+
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var recording: Recording? = null
+    private var recorded = 0
+    private var recordStartMs = 0L
+    private var thermal: ThermalUsbStream? = null
+    private var thermalMode = false
+    @Volatile private var thermalStatus = "Starting thermal input…"
+    private var lastThermalMs = 0L
 
     private val requestCamera =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -74,16 +116,30 @@ class DemoActivity : ComponentActivity() {
             text = "Loading model…"
         }
         logger = NoHandLogger(getExternalFilesDir(null)!!)
-        logButton = Button(this).apply {
-            text = "Log NO-HAND: off"
-            setOnClickListener { toggleLogging() }
+        sessions = SessionRecorder(getExternalFilesDir(null)!!)
+        thermalView = ThermalView(this).apply { visibility = View.GONE }
+        thermalInset = ThermalView(this).apply { visibility = View.GONE }
+        recordingLabel = TextView(this).apply {
+            textSize = 28f
+            setTextColor(Color.RED)
+            setShadowLayer(8f, 0f, 0f, Color.BLACK)
+            gravity = Gravity.CENTER_HORIZONTAL
+            visibility = View.INVISIBLE
+        }
+        val options = Button(this).apply {
+            text = "Options ▾"
+            setOnClickListener { showOptions(it) }
         }
         setContentView(FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(previewView, FrameLayout.LayoutParams(-1, -1))
             addView(outlineView, FrameLayout.LayoutParams(-1, -1))
+            addView(thermalView, FrameLayout.LayoutParams(-1, -1))
+            addView(thermalInset, FrameLayout.LayoutParams(INSET_W, INSET_W * 3 / 4, Gravity.TOP or Gravity.END)
+                .apply { topMargin = 330; rightMargin = 24 })
             addView(status, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = 120 })
-            addView(logButton, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+            addView(recordingLabel, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = 260 })
+            addView(options, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
                 .apply { bottomMargin = 200 })
         })
 
@@ -103,19 +159,189 @@ class DemoActivity : ComponentActivity() {
         }
     }
 
-    private fun toggleLogging() {
+    private fun showOptions(anchor: View) {
+        PopupMenu(this, anchor).apply {
+            menu.add(0, MENU_RECORD, 0, "Record camera + thermal").apply {
+                isCheckable = true
+                isChecked = sessions.active
+            }
+            menu.add(0, MENU_DUMP, 1, "Dump NO-HAND frames").apply {
+                isCheckable = true
+                isChecked = logger.enabled
+            }
+            menu.add(0, MENU_THERMAL, 2, "Stream thermal input").apply {
+                isCheckable = true
+                isChecked = thermalMode
+            }
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    MENU_RECORD -> if (sessions.active) stopRecording() else startRecording()
+                    MENU_DUMP -> setLogging(!logger.enabled)
+                    MENU_THERMAL -> setThermalMode(!thermalMode)
+                }
+                true
+            }
+        }.show()
+    }
+
+    private fun setLogging(on: Boolean) {
         // Flip on the analysis thread so a frame never sees a half-started session.
         analysisExecutor.execute {
-            val label = if (logger.enabled) {
-                logger.stop()
-                "Log NO-HAND: off (${logger.dumpCount} saved)"
+            if (on == logger.enabled) return@execute
+            if (on) {
+                Log.i(TAG, "diagnostics -> ${logger.start()}")
             } else {
-                val dir = logger.start()
-                Log.i(TAG, "diagnostics -> $dir")
-                "Log NO-HAND: ON"
+                logger.stop()
+                val saved = logger.dumpCount
+                runOnUiThread { status.text = "NO-HAND logging off — $saved frames saved" }
             }
-            runOnUiThread { logButton.text = label }
         }
+    }
+
+    /** Starts the session (camera frames + thermal packets) and, if the camera supports it, the video. */
+    private fun startRecording() {
+        if (sessions.active) return
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val meta = sessionMeta(stamp)
+        videoCapture?.let { capture ->
+            val dir = File(getExternalFilesDir(null), "videos").apply { mkdirs() }
+            val file = File(dir, "hand_$stamp.mp4")
+            meta.put("video", "videos/${file.name}")
+            recording = capture.output
+                .prepareRecording(this, FileOutputOptions.Builder(file).build())
+                .start(ContextCompat.getMainExecutor(this)) { event -> onRecordEvent(event, file) }
+        }
+        val dir = sessions.start(stamp, meta)
+        Log.i(TAG, "session -> $dir")
+        recordStartMs = SystemClock.elapsedRealtime()
+        recordingLabel.text = "● 0:00"
+        recordingLabel.visibility = View.VISIBLE
+    }
+
+    private fun stopRecording() {
+        if (!sessions.active && recording == null) return
+        val frames = sessions.cameraFrames
+        val packets = sessions.thermalPackets
+        sessions.stop()
+        recording?.stop()
+        recording = null
+        recordingLabel.text = "Saved session: $frames camera frames, $packets thermal packets"
+    }
+
+    /** Called on the UI thread while recording, from the analysis loop. */
+    private fun updateRecordingLabel() {
+        if (!sessions.active) return
+        val s = (SystemClock.elapsedRealtime() - recordStartMs) / 1000
+        recordingLabel.text = String.format(Locale.US, "● %d:%02d   %d cam   %d thermal",
+            s / 60, s % 60, sessions.cameraFrames, sessions.thermalPackets)
+    }
+
+    private fun onRecordEvent(event: VideoRecordEvent, file: File) {
+        if (event is VideoRecordEvent.Finalize) {
+            if (event.hasError()) {
+                Log.e(TAG, "recording error ${event.error}", event.cause)
+                recordingLabel.text = "Video error ${event.error}: ${event.cause?.message}"
+            } else {
+                recorded += 1
+                Log.i(TAG, "saved ${file.name} (${file.length() / 1_000_000} MB), $recorded this run")
+            }
+        }
+    }
+
+    /** Everything needed later to map camera pixels to rays: camera characteristics and device info. */
+    @OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun sessionMeta(stamp: String): JSONObject {
+        val meta = JSONObject()
+            .put("created", stamp)
+            .put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
+            .put("model_asset", MODEL_ASSET)
+            .put("thermal_sensor", "MLX90640 110x75 deg, taped to the back of the phone")
+        val info = camera?.cameraInfo ?: return meta
+        val c2 = Camera2CameraInfo.from(info)
+        fun floats(values: FloatArray?) = values?.let { JSONArray(it.map { v -> v.toDouble() }) }
+        val cam = JSONObject().put("camera_id", c2.cameraId)
+        cam.putOpt("intrinsic_calibration", floats(c2.getCameraCharacteristic(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            cam.putOpt("distortion", floats(c2.getCameraCharacteristic(CameraCharacteristics.LENS_DISTORTION)))
+        }
+        cam.putOpt("pose_translation", floats(c2.getCameraCharacteristic(CameraCharacteristics.LENS_POSE_TRANSLATION)))
+        cam.putOpt("pose_rotation", floats(c2.getCameraCharacteristic(CameraCharacteristics.LENS_POSE_ROTATION)))
+        cam.putOpt("focal_lengths_mm", floats(c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)))
+        c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)?.let {
+            cam.put("sensor_physical_mm", JSONArray(listOf(it.width.toDouble(), it.height.toDouble())))
+        }
+        c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.let {
+            cam.put("pixel_array", JSONArray(listOf(it.width, it.height)))
+        }
+        c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.let {
+            cam.put("active_array", JSONArray(listOf(it.left, it.top, it.right, it.bottom)))
+        }
+        cam.putOpt("sensor_orientation", c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_ORIENTATION))
+        cam.put("timestamp_source",
+            if (c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
+                CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) "realtime" else "unknown")
+        return meta.put("camera", cam)
+    }
+
+    /** Thermal mode shows only the thermal stream; the camera keeps running (hidden) for recording. */
+    private fun setThermalMode(on: Boolean) {
+        if (on == thermalMode) return
+        thermalMode = on
+        val camera = if (on) View.GONE else View.VISIBLE
+        previewView.visibility = camera
+        outlineView.visibility = camera
+        thermalView.visibility = if (on) View.VISIBLE else View.GONE
+        thermalInset.visibility = View.GONE
+        status.setTextColor(Color.WHITE)
+        status.text = if (on) thermalStatus else "…"
+    }
+
+    private fun startThermal() {
+        if (thermal != null) return
+        lastThermalMs = 0L
+        thermal = ThermalUsbStream(this, ::onThermalFrame) { text ->
+            thermalStatus = text
+            runOnUiThread {
+                thermalInset.visibility = View.GONE
+                if (thermalMode) status.text = text
+            }
+        }.also { it.start() }
+    }
+
+    private fun stopThermal() {
+        thermal?.stop()
+        thermal = null
+    }
+
+    /** Called on the USB thread. */
+    private fun onThermalFrame(frame: ThermalFrame) {
+        sessions.onThermalFrame(frame)
+        if (!thermalMode) {
+            thermalInset.update(frame)
+            if (thermalInset.visibility != View.VISIBLE) runOnUiThread { if (!thermalMode) thermalInset.visibility = View.VISIBLE }
+        }
+        thermalView.update(frame)
+        val nowMs = frame.receivedNs / 1_000_000
+        val fps = if (lastThermalMs > 0) 1000f / (nowMs - lastThermalMs) else 0f
+        lastThermalMs = nowMs
+        val (low, high) = thermalView.range
+        val max = frame.celsius.max()
+        val text = String.format(
+            Locale.US, "%.1f–%.1f °C   |   max %.1f °C   |   sensor %.1f °C   |   %.0f fps",
+            low, high, max, frame.ambientC, fps,
+        )
+        runOnUiThread { if (thermalMode) status.text = text }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        startThermal()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        stopRecording()
+        stopThermal()
     }
 
     override fun onDestroy() {
@@ -127,22 +353,43 @@ class DemoActivity : ComponentActivity() {
     private fun startCamera() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
-            val provider = providerFuture.get()
-            // Same 4:3 stream shape for preview and analysis, so analysis pixels map straight onto the preview.
-            val ratio = ResolutionSelector.Builder()
-                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-                .build()
-            val preview = Preview.Builder().setResolutionSelector(ratio).build()
-                .also { it.surfaceProvider = previewView.surfaceProvider }
-            val analysis = ImageAnalysis.Builder()
-                .setResolutionSelector(ratio)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-                .also { it.setAnalyzer(analysisExecutor, ::analyze) }
-            provider.unbindAll()
-            provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+            cameraProvider = providerFuture.get()
+            if (!thermalMode) bindCamera()
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun bindCamera() {
+        val provider = cameraProvider ?: return
+        // Same 4:3 stream shape for preview and analysis, so analysis pixels map straight onto the preview.
+        val ratio = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+            .build()
+        val preview = Preview.Builder().setResolutionSelector(ratio).build()
+            .also { it.surfaceProvider = previewView.surfaceProvider }
+        val analysis = ImageAnalysis.Builder()
+            .setResolutionSelector(ratio)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .build()
+            .also { it.setAnalyzer(analysisExecutor, ::analyze) }
+        val recorder = Recorder.Builder()
+            .setQualitySelector(
+                QualitySelector.from(Quality.FHD, FallbackStrategy.higherQualityOrLowerThan(Quality.FHD))
+            )
+            .setTargetVideoEncodingBitRate(BITRATE)
+            .build()
+        val capture = VideoCapture.withOutput(recorder)
+        provider.unbindAll()
+        videoCapture = try {
+            camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis, capture)
+            capture
+        } catch (e: IllegalArgumentException) {
+            // Some cameras cannot run preview + analysis + video at once: keep the demo, lose Record.
+            Log.w(TAG, "video capture unavailable alongside analysis", e)
+            provider.unbindAll()
+            camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+            null
+        }
     }
 
     private fun analyze(image: ImageProxy) {
@@ -153,6 +400,11 @@ class DemoActivity : ComponentActivity() {
         }
         // Upright frame, then the centred square (same box the overlay draws).
         val rotation = image.imageInfo.rotationDegrees
+        val sensorTsNs = image.imageInfo.timestamp
+        val analysisNs = SystemClock.elapsedRealtimeNanos()
+        val bufferW = image.width
+        val bufferH = image.height
+        val sensorToBuffer = FloatArray(9).also { image.imageInfo.sensorToBufferTransformMatrix.getValues(it) }
         val raw = image.toBitmap()
         image.close()
         val frame = if (rotation == 0) raw else
@@ -184,8 +436,12 @@ class DemoActivity : ComponentActivity() {
         val handVisible = present > PRESENT_THRESHOLD
         outlineView.update(frame.width, frame.height, left, top, side, if (handVisible) edgePoints(mask) else null)
         logger.onFrame(now, crop, input, mask, present, inferMs, handVisible, frame.width, frame.height, rotation)
+        sessions.onCameraFrame(sensorTsNs, analysisNs, frame.width, frame.height, rotation, left, top, side, crop,
+            mask, present, handVisible, inferMs, sensorToBuffer, bufferW, bufferH)
         val logging = if (logger.enabled) "   |   ${logger.dumpCount} dumped" else ""
         runOnUiThread {
+            updateRecordingLabel()
+            if (thermalMode) return@runOnUiThread
             status.text = String.format(
                 Locale.US, "%s  %.2f   |   %d ms model   |   %.0f fps%s",
                 if (handVisible) "HAND" else "NO HAND", present, inferMs, fps, logging,
@@ -194,10 +450,44 @@ class DemoActivity : ComponentActivity() {
         }
     }
 
-    /** Mask pixels (prob > 0.5) with a 4-neighbour outside the mask, as (u, v) pairs in model pixels. */
+    /**
+     * Outline of the single largest blob in the mask (prob > 0.5), as (u, v) pairs in model pixels.
+     * The model can mark stray skin-coloured patches as separate blobs; there is only one hand, so
+     * everything but the largest connected region is dropped.
+     */
     private fun edgePoints(mask: FloatArray): FloatArray {
+        val labels = IntArray(SIZE * SIZE)
+        val queue = IntArray(SIZE * SIZE)
+        var best = 0
+        var bestArea = 0
+        var next = 0
+        for (start in 0 until SIZE * SIZE) {
+            if (mask[start] <= 0.5f || labels[start] != 0) continue
+            next++
+            var head = 0
+            var tail = 0
+            queue[tail++] = start
+            labels[start] = next
+            while (head < tail) {
+                val i = queue[head++]
+                val u = i % SIZE
+                val v = i / SIZE
+                for (j in intArrayOf(if (u > 0) i - 1 else -1, if (u < SIZE - 1) i + 1 else -1,
+                                     if (v > 0) i - SIZE else -1, if (v < SIZE - 1) i + SIZE else -1)) {
+                    if (j >= 0 && labels[j] == 0 && mask[j] > 0.5f) {
+                        labels[j] = next
+                        queue[tail++] = j
+                    }
+                }
+            }
+            if (tail > bestArea) {
+                bestArea = tail
+                best = next
+            }
+        }
         val out = ArrayList<Float>()
-        fun inside(u: Int, v: Int) = u in 0 until SIZE && v in 0 until SIZE && mask[v * SIZE + u] > 0.5f
+        if (best == 0) return out.toFloatArray()
+        fun inside(u: Int, v: Int) = u in 0 until SIZE && v in 0 until SIZE && labels[v * SIZE + u] == best
         for (v in 0 until SIZE) for (u in 0 until SIZE) {
             if (inside(u, v) && (!inside(u - 1, v) || !inside(u + 1, v) || !inside(u, v - 1) || !inside(u, v + 1))) {
                 out.add(u + 0.5f)
@@ -256,6 +546,11 @@ class DemoActivity : ComponentActivity() {
         private const val SIZE = 384
         private const val BOX_FRACTION = 0.9f
         private const val PRESENT_THRESHOLD = 0.5f
+        private const val BITRATE = 20_000_000  // high bitrate keeps finger edges free of compression mush
+        private const val MENU_RECORD = 1
+        private const val MENU_DUMP = 2
+        private const val MENU_THERMAL = 3
+        private const val INSET_W = 360
         private val MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val STD = floatArrayOf(0.229f, 0.224f, 0.225f)
 

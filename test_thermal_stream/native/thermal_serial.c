@@ -8,11 +8,11 @@
 #include <unistd.h>
 
 #define HEADER_BYTES 28U
-#define FRAME_WORDS 834U
-#define PAYLOAD_BYTES (FRAME_WORDS * 2U)
+#define PAYLOAD_WORDS 769U
+#define PAYLOAD_BYTES (PAYLOAD_WORDS * 2U)
 #define PACKET_BYTES (HEADER_BYTES + PAYLOAD_BYTES)
 
-static const uint8_t magic[] = {'T', 'H', 'M', '1'};
+static const uint8_t magic[] = {'T', 'H', 'M', '2'};
 
 static uint16_t read_u16_le(const uint8_t *data)
 {
@@ -42,9 +42,9 @@ static uint32_t crc32(const uint8_t *data, size_t length)
 
 static int valid_packet(const uint8_t *packet)
 {
-    return packet[4] == 1U && packet[5] <= 1U &&
+    return packet[4] == 2U && packet[5] <= 1U &&
            read_u16_le(&packet[6]) == HEADER_BYTES &&
-           read_u16_le(&packet[20]) == FRAME_WORDS &&
+           read_u16_le(&packet[20]) == PAYLOAD_WORDS &&
            packet[22] == 32U && packet[23] == 24U &&
            read_u32_le(&packet[24]) == crc32(&packet[HEADER_BYTES], PAYLOAD_BYTES);
 }

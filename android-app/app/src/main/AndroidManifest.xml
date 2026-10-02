@@ -1,28 +1,29 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-feature android:name="android.hardware.camera.any" />
+    <!-- The thermal camera plugs in over USB-C OTG and is powered by the phone. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
     <uses-permission android:name="android.permission.CAMERA" />
 
     <application
         android:label="EU Hack"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:screenOrientation="portrait">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-        <activity
             android:name=".DemoActivity"
             android:exported="true"
             android:label="Hand Demo"
+            android:launchMode="singleTop"
             android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Plugging the thermal camera in offers to open the app, which also grants USB access. -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
         </activity>
     </application>
 </manifest>

@@ -1,5 +1,6 @@
 #include "thermal_stream.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -10,18 +11,23 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "mlx90640_raw.h"
+#include "mlx90640_thermal.h"
 
 #define THERMAL_I2C_HZ 900000U
+#define STREAM_VERSION 2U
 #define STREAM_HEADER_BYTES 28U
-#define STREAM_PAYLOAD_BYTES (MLX90640_RAW_FRAME_WORDS * 2U)
+/* Payload: 768 pixel temperatures then the ambient temperature, int16 centi-degrees C. */
+#define STREAM_PAYLOAD_WORDS (MLX90640_THERMAL_PIXELS + 1U)
+#define STREAM_PAYLOAD_BYTES (STREAM_PAYLOAD_WORDS * 2U)
 #define STREAM_PACKET_BYTES (STREAM_HEADER_BYTES + STREAM_PAYLOAD_BYTES)
-#define STREAM_TASK_STACK_BYTES 4096U
+#define STREAM_TASK_STACK_BYTES 8192U
 #define STREAM_TASK_PRIORITY 5U
 #define STREAM_MAX_CONSECUTIVE_ERRORS 5U
+/* Chess mode refreshes half the pixels per subpage: wait for both before sending. */
+#define STREAM_WARMUP_SUBPAGES 2U
 
 static const char *TAG = "thermal_stream";
-static mlx90640_raw_frame_t raw_frame;
+static mlx90640_thermal_frame_t thermal_frame;
 static uint8_t packet[STREAM_PACKET_BYTES];
 
 static void put_u16_le(uint8_t *destination, uint16_t value)
@@ -57,24 +63,39 @@ static uint32_t crc32(const uint8_t *data, size_t length)
     return ~crc;
 }
 
+static uint16_t centi_celsius(float celsius)
+{
+    if (isnan(celsius)) {
+        return (uint16_t)INT16_MIN;
+    }
+    const float centi = roundf(celsius * 100.0f);
+    const float clamped = fminf(fmaxf(centi, (float)(INT16_MIN + 1)), (float)INT16_MAX);
+    return (uint16_t)(int16_t)clamped;
+}
+
 static void encode_packet(uint32_t sequence)
 {
     packet[0] = 'T';
     packet[1] = 'H';
     packet[2] = 'M';
-    packet[3] = '1';
-    packet[4] = 1U;
-    packet[5] = raw_frame.subpage;
+    packet[3] = '2';
+    packet[4] = STREAM_VERSION;
+    packet[5] = thermal_frame.subpage;
     put_u16_le(&packet[6], STREAM_HEADER_BYTES);
     put_u32_le(&packet[8], sequence);
     put_u64_le(&packet[12], (uint64_t)esp_timer_get_time());
-    put_u16_le(&packet[20], MLX90640_RAW_FRAME_WORDS);
-    packet[22] = MLX90640_RAW_WIDTH;
-    packet[23] = MLX90640_RAW_HEIGHT;
+    put_u16_le(&packet[20], STREAM_PAYLOAD_WORDS);
+    packet[22] = MLX90640_THERMAL_WIDTH;
+    packet[23] = MLX90640_THERMAL_HEIGHT;
 
-    for (size_t index = 0; index < MLX90640_RAW_FRAME_WORDS; ++index) {
-        put_u16_le(&packet[STREAM_HEADER_BYTES + index * 2U], raw_frame.words[index]);
+    for (size_t index = 0; index < MLX90640_THERMAL_PIXELS; ++index) {
+        put_u16_le(
+            &packet[STREAM_HEADER_BYTES + index * 2U],
+            centi_celsius(thermal_frame.pixels_c[index]));
     }
+    put_u16_le(
+        &packet[STREAM_HEADER_BYTES + MLX90640_THERMAL_PIXELS * 2U],
+        centi_celsius(thermal_frame.ambient_c));
 
     put_u32_le(
         &packet[24],
@@ -101,7 +122,7 @@ static void stream_task(void *context)
 
     esp_err_t error;
     do {
-        error = mlx90640_raw_init(
+        error = mlx90640_thermal_init(
             BOARD_STEMMA_SDA_GPIO,
             BOARD_STEMMA_SCL_GPIO,
             THERMAL_I2C_HZ);
@@ -117,17 +138,18 @@ static void stream_task(void *context)
     usb_serial_jtag_vfs_use_driver();
     usb_serial_jtag_vfs_set_tx_line_endings(ESP_LINE_ENDINGS_LF);
 
-    ESP_LOGI(TAG, "MLX90640 streaming raw frames at 900 kHz I2C");
+    ESP_LOGI(TAG, "MLX90640 streaming calibrated temperatures, 8 subpages/s");
     vTaskDelay(pdMS_TO_TICKS(50U));
     esp_log_level_set("*", ESP_LOG_NONE);
 
     uint32_t sequence = 0U;
     uint32_t consecutive_errors = 0U;
+    uint32_t subpages_read = 0U;
     for (;;) {
-        error = mlx90640_raw_read_frame(&raw_frame);
+        error = mlx90640_thermal_read(&thermal_frame);
         if (error != ESP_OK) {
             if (++consecutive_errors >= STREAM_MAX_CONSECUTIVE_ERRORS) {
-                (void)mlx90640_raw_reset_bus();
+                (void)mlx90640_thermal_reset_bus();
                 consecutive_errors = 0U;
             }
             vTaskDelay(pdMS_TO_TICKS(1U));
@@ -135,6 +157,10 @@ static void stream_task(void *context)
         }
 
         consecutive_errors = 0U;
+        if (subpages_read < STREAM_WARMUP_SUBPAGES) {
+            ++subpages_read;
+            continue;
+        }
         encode_packet(sequence++);
         send_packet();
     }

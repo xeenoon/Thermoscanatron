@@ -1,7 +1,9 @@
-#include "mlx90640_raw.h"
+#include "mlx90640_thermal.h"
 
 #include <stddef.h>
 
+#include "MLX90640_API.h"
+#include "MLX90640_I2C_Driver.h"
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -11,6 +13,9 @@
 #define MLX90640_CONTROL_REGISTER 0x800DU
 #define MLX90640_PIXEL_START_REGISTER 0x0400U
 #define MLX90640_AUX_START_REGISTER 0x0700U
+#define MLX90640_AUX_WORDS 64U
+#define MLX90640_FRAME_WORDS 834U
+#define MLX90640_AUX_INVALID 0x7FFFU
 #define MLX90640_DATA_READY_MASK 0x0008U
 #define MLX90640_SUBPAGE_MASK 0x0001U
 #define MLX90640_STATUS_CLEAR_VALUE 0x0030U
@@ -19,10 +24,18 @@
 #define MLX90640_CHESS_MODE_MASK 0x1000U
 #define MLX90640_TRANSACTION_TIMEOUT_MS 100
 #define MLX90640_FRAME_TIMEOUT_MS 500U
+#define MLX90640_CHESS_MODE 1
+#define MLX90640_EMISSIVITY 0.95f
+/* Melexis: in open air the reflected temperature is the sensor ambient minus 8 degrees C. */
+#define MLX90640_TA_SHIFT_C 8.0f
 
 static i2c_master_bus_handle_t sensor_bus;
 static i2c_master_dev_handle_t sensor_device;
-static uint8_t transfer_buffer[MLX90640_RAW_PIXEL_WORDS * 2U];
+static uint8_t transfer_buffer[MLX90640_THERMAL_PIXELS * 2U];
+static uint16_t eeprom[MLX90640_EEPROM_DUMP_NUM];
+static paramsMLX90640 calibration;
+/* Melexis frame layout: 768 pixel words, 64 aux words, control register, subpage. */
+static uint16_t frame_words[MLX90640_FRAME_WORDS];
 
 static void release_bus(void)
 {
@@ -38,7 +51,7 @@ static void release_bus(void)
 
 static esp_err_t read_words(uint16_t start_register, uint16_t *words, size_t word_count)
 {
-    if (word_count > MLX90640_RAW_PIXEL_WORDS) {
+    if (word_count > MLX90640_THERMAL_PIXELS) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -82,7 +95,45 @@ static esp_err_t write_word(uint16_t target_register, uint16_t value)
         MLX90640_TRANSACTION_TIMEOUT_MS);
 }
 
-esp_err_t mlx90640_raw_init(int sda_gpio, int scl_gpio, uint32_t bus_hz)
+/* I2C callbacks required by the Melexis library (MLX90640_I2C_Driver.h). */
+void MLX90640_I2CInit(void)
+{
+}
+
+void MLX90640_I2CFreqSet(int freq)
+{
+    (void)freq;
+}
+
+int MLX90640_I2CGeneralReset(void)
+{
+    return mlx90640_thermal_reset_bus() == ESP_OK ? 0 : -1;
+}
+
+int MLX90640_I2CRead(uint8_t slaveAddr, uint16_t startAddress, uint16_t nMemAddressRead, uint16_t *data)
+{
+    (void)slaveAddr;
+    while (nMemAddressRead > 0U) {
+        const uint16_t count = nMemAddressRead > MLX90640_THERMAL_PIXELS
+            ? (uint16_t)MLX90640_THERMAL_PIXELS
+            : nMemAddressRead;
+        if (read_words(startAddress, data, count) != ESP_OK) {
+            return -1;
+        }
+        startAddress += count;
+        data += count;
+        nMemAddressRead -= count;
+    }
+    return 0;
+}
+
+int MLX90640_I2CWrite(uint8_t slaveAddr, uint16_t writeAddress, uint16_t data)
+{
+    (void)slaveAddr;
+    return write_word(writeAddress, data) == ESP_OK ? 0 : -1;
+}
+
+esp_err_t mlx90640_thermal_init(int sda_gpio, int scl_gpio, uint32_t bus_hz)
 {
     if (sensor_device != NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -119,6 +170,17 @@ esp_err_t mlx90640_raw_init(int sda_gpio, int scl_gpio, uint32_t bus_hz)
         return error;
     }
 
+    if (MLX90640_DumpEE(MLX90640_ADDRESS, eeprom) != 0) {
+        release_bus();
+        return ESP_FAIL;
+    }
+    /* Bad- and outlier-pixel warnings are fine (they are corrected per frame); only a
+     * corrupt EEPROM is fatal. */
+    if (MLX90640_ExtractParameters(eeprom, &calibration) == -MLX90640_EEPROM_DATA_ERROR) {
+        release_bus();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     uint16_t control_register;
     error = read_words(MLX90640_CONTROL_REGISTER, &control_register, 1U);
     if (error != ESP_OK) {
@@ -135,7 +197,7 @@ esp_err_t mlx90640_raw_init(int sda_gpio, int scl_gpio, uint32_t bus_hz)
     return error;
 }
 
-esp_err_t mlx90640_raw_read_frame(mlx90640_raw_frame_t *frame)
+esp_err_t mlx90640_thermal_read(mlx90640_thermal_frame_t *frame)
 {
     if (sensor_device == NULL || frame == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -160,42 +222,57 @@ esp_err_t mlx90640_raw_read_frame(mlx90640_raw_frame_t *frame)
         return ESP_ERR_TIMEOUT;
     }
 
-    frame->subpage = (uint8_t)(status_register & MLX90640_SUBPAGE_MASK);
+    const uint8_t subpage = (uint8_t)(status_register & MLX90640_SUBPAGE_MASK);
 
     esp_err_t error = write_word(MLX90640_STATUS_REGISTER, MLX90640_STATUS_CLEAR_VALUE);
     if (error != ESP_OK) {
         return error;
     }
 
-    error = read_words(
-        MLX90640_PIXEL_START_REGISTER,
-        frame->words,
-        MLX90640_RAW_PIXEL_WORDS);
+    error = read_words(MLX90640_PIXEL_START_REGISTER, frame_words, MLX90640_THERMAL_PIXELS);
     if (error != ESP_OK) {
         return error;
     }
 
     error = read_words(
         MLX90640_AUX_START_REGISTER,
-        &frame->words[MLX90640_RAW_PIXEL_WORDS],
-        MLX90640_RAW_AUX_WORDS);
+        &frame_words[MLX90640_THERMAL_PIXELS],
+        MLX90640_AUX_WORDS);
     if (error != ESP_OK) {
         return error;
     }
 
     error = read_words(
         MLX90640_CONTROL_REGISTER,
-        &frame->words[MLX90640_RAW_PIXEL_WORDS + MLX90640_RAW_AUX_WORDS],
+        &frame_words[MLX90640_THERMAL_PIXELS + MLX90640_AUX_WORDS],
         1U);
     if (error != ESP_OK) {
         return error;
     }
+    frame_words[MLX90640_FRAME_WORDS - 1U] = subpage;
 
-    frame->words[MLX90640_RAW_FRAME_WORDS - 1U] = frame->subpage;
+    /* A glitched read returns 0x7FFF in the supply and ambient aux words. */
+    if (frame_words[MLX90640_THERMAL_PIXELS] == MLX90640_AUX_INVALID ||
+        frame_words[MLX90640_THERMAL_PIXELS + 32U] == MLX90640_AUX_INVALID) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const float ambient_c = MLX90640_GetTa(frame_words, &calibration);
+    MLX90640_CalculateTo(
+        frame_words,
+        &calibration,
+        MLX90640_EMISSIVITY,
+        ambient_c - MLX90640_TA_SHIFT_C,
+        frame->pixels_c);
+    MLX90640_BadPixelsCorrection(calibration.brokenPixels, frame->pixels_c, MLX90640_CHESS_MODE, &calibration);
+    MLX90640_BadPixelsCorrection(calibration.outlierPixels, frame->pixels_c, MLX90640_CHESS_MODE, &calibration);
+
+    frame->ambient_c = ambient_c;
+    frame->subpage = subpage;
     return ESP_OK;
 }
 
-esp_err_t mlx90640_raw_reset_bus(void)
+esp_err_t mlx90640_thermal_reset_bus(void)
 {
     return sensor_bus == NULL ? ESP_ERR_INVALID_STATE : i2c_master_bus_reset(sensor_bus);
 }

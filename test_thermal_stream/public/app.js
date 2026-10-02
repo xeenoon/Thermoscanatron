@@ -1,5 +1,6 @@
 const canvas = document.querySelector('#thermal');
 const context = canvas.getContext('2d');
+const readout = document.querySelector('#readout');
 const sensorCanvas = document.createElement('canvas');
 const sensorContext = sensorCanvas.getContext('2d');
 sensorCanvas.width = 32;
@@ -75,6 +76,11 @@ function drawFrame(frame) {
   context.imageSmoothingEnabled = true;
   context.imageSmoothingQuality = 'high';
   context.drawImage(sensorCanvas, 0, 0, canvas.width, canvas.height);
+
+  const hottest = Math.max(...frame.pixels);
+  const centre = frame.pixels[(frame.height / 2) * frame.width + frame.width / 2];
+  readout.textContent = `${minimum.toFixed(1)}–${maximum.toFixed(1)} °C   max ${hottest.toFixed(1)} °C   ` +
+    `centre ${centre.toFixed(1)} °C   sensor ${frame.ambientC.toFixed(1)} °C`;
 }
 
 function connect() {

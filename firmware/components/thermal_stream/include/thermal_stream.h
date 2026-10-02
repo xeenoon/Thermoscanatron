@@ -3,7 +3,7 @@
 
 #include "esp_err.h"
 
-/** Start raw MLX90640 capture and USB serial transmission. */
+/** Start calibrated MLX90640 capture and USB serial transmission. */
 esp_err_t thermal_stream_start(void);
 
 #endif

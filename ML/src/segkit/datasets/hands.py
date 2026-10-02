@@ -6,6 +6,9 @@ MediaPipe ROI crop the phone pipeline will use. Training crops jitter scale, cen
 Negatives ("no hand here"): frames labelled no_hand (empty mask) give random crops, and a share of
 training samples from hand frames are background crops chosen to miss the hand. Every sample also
 returns a hand-present target: 1 if at least PRESENT_MIN_FRACTION of the crop is hand.
+
+Background swap (training only): a share of hand crops get everything outside the hand mask replaced by
+a hand-free crop from a random other frame, so the model cannot learn "hand = whatever isn't this room".
 """
 
 import csv
@@ -28,12 +31,20 @@ VAL_EVERY = 5           # every 5th block is validation: ~20%, and no near-dupli
 SKIP_FLAGS = {"landmarks_outside"}  # rembg mask disagrees with MediaPipe: not trusted
 BACKGROUND_CROP_P = 0.25            # share of hand-frame training samples cropped away from the hand
 PRESENT_MIN_FRACTION = 0.005        # crop counts as "hand present" above this hand-pixel fraction
+BACKGROUND_SWAP_P = 0.5             # share of hand crops whose background is replaced (training only)
+EXTERNAL_BACKGROUND_P = 0.7         # of those, share whose new background comes from the negatives list
+SWAP_FEATHER_PX = 2                 # soften the pasted edge so the model can't key on a hard seam
 
 
 def normalize(rgb_u8: np.ndarray) -> torch.Tensor:
     """HWC uint8 RGB -> contiguous CHW float tensor, ImageNet-normalised."""
     x = (rgb_u8.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
     return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1)))
+
+
+def session_of(stem: str) -> str:
+    """Recording session (video) a frame came from: the stem minus its _f<frame> suffix."""
+    return FRAME_RE.sub("", stem)
 
 
 def is_val(stem: str) -> bool:
@@ -67,14 +78,58 @@ def crop_affine(bbox: tuple[int, int, int, int], size: int, scale: float, shift:
                      [sin, cos, size / 2 - sin * cx - cos * cy]], np.float32)
 
 
+def random_square(rgb: np.ndarray, size: int, rng: np.random.Generator | None, train: bool = True) -> np.ndarray:
+    """Random (train) or centred square crop of any image, resized to size x size."""
+    h, w = rgb.shape[:2]
+    if train:
+        side = rng.uniform(0.4, 1.0) * min(h, w)
+        x0, y0 = rng.uniform(0, w - side), rng.uniform(0, h - side)
+        m = crop_affine((x0, y0, x0 + side, y0 + side), size, 1.0, (0, 0), rng.uniform(-180, 180))
+    else:
+        side = min(h, w)
+        m = crop_affine(((w - side) / 2, (h - side) / 2, (w + side) / 2, (h + side) / 2), size, 1.0, (0, 0), 0.0)
+    return cv2.warpAffine(rgb, m, (size, size), flags=cv2.INTER_AREA, borderMode=cv2.BORDER_REFLECT_101)
+
+
+class NegativeImages(Dataset):
+    """Hand-free photos (e.g. COCO without people): empty mask, hand-present = 0."""
+
+    def __init__(self, paths: list[Path], size: int = 384, train: bool = True):
+        self.paths, self.size, self.train = paths, size, train
+        self.photometric = A.Compose([
+            A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05, p=0.8),
+            A.OneOf([A.MotionBlur(blur_limit=7), A.GaussianBlur(blur_limit=(3, 5))], p=0.3),
+            A.GaussNoise(std_range=(0.01, 0.05), p=0.3),
+            A.ImageCompression(quality_range=(50, 95), p=0.3),
+        ])
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rgb = cv2.cvtColor(cv2.imread(str(self.paths[i])), cv2.COLOR_BGR2RGB)
+        rng = np.random.default_rng(None if self.train else i)
+        img = random_square(rgb, self.size, rng, self.train)
+        if self.train:
+            img = self.photometric(image=img)["image"]
+        return normalize(img), torch.zeros(1, self.size, self.size), torch.zeros(1)
+
+
+def read_list(path: Path | None) -> list[Path]:
+    if path is None:
+        return []
+    return [Path(line) for line in path.read_text().splitlines() if line.strip()]
+
+
 class HandCrops(Dataset):
     """train: random hand/background crops. Otherwise deterministic: a centred hand crop, or with
     background_only, a seeded crop that misses the hand (validation negatives)."""
 
     def __init__(self, dataset: Path, stems: list[str], size: int = 384, train: bool = True,
-                 background_only: bool = False):
+                 background_only: bool = False, negatives: list[Path] | None = None):
         self.dataset, self.stems, self.size, self.train = dataset, stems, size, train
         self.background_only = background_only
+        self.negatives = negatives or []
         self.photometric = A.Compose([
             A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05, p=0.8),
             A.OneOf([A.MotionBlur(blur_limit=7), A.GaussianBlur(blur_limit=(3, 5))], p=0.3),
@@ -95,10 +150,33 @@ class HandCrops(Dataset):
                 return crop_affine((x0, y0, x0 + side, y0 + side), self.size, 1.0, (0, 0), rng.uniform(-180, 180))
         return None
 
+    def load(self, stem: str) -> tuple[np.ndarray, np.ndarray]:
+        rgb = cv2.cvtColor(cv2.imread(str(self.dataset / "images" / f"{stem}.jpg")), cv2.COLOR_BGR2RGB)
+        return rgb, cv2.imread(str(self.dataset / "masks" / f"{stem}.png"), cv2.IMREAD_GRAYSCALE)
+
+    def random_background(self, rng: np.random.Generator) -> np.ndarray | None:
+        """A size x size hand-free crop: from the negatives list, or from a frame of our own (away from the hand)."""
+        if self.negatives and rng.random() < EXTERNAL_BACKGROUND_P:
+            bgr = cv2.imread(str(self.negatives[rng.integers(len(self.negatives))]))
+            if bgr is not None:
+                return random_square(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), self.size, rng)
+        for _ in range(3):
+            rgb, mask = self.load(self.stems[rng.integers(len(self.stems))])
+            h, w = mask.shape
+            if mask.any():
+                m = self.background_crop(mask, rng)
+            else:
+                side = rng.uniform(0.3, 0.9) * min(h, w)
+                x0, y0 = rng.uniform(0, w - side), rng.uniform(0, h - side)
+                m = crop_affine((x0, y0, x0 + side, y0 + side), self.size, 1.0, (0, 0), rng.uniform(-180, 180))
+            if m is not None:
+                return cv2.warpAffine(rgb, m, (self.size, self.size), flags=cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_REFLECT_101)
+        return None
+
     def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         stem = self.stems[i]
-        rgb = cv2.cvtColor(cv2.imread(str(self.dataset / "images" / f"{stem}.jpg")), cv2.COLOR_BGR2RGB)
-        mask = cv2.imread(str(self.dataset / "masks" / f"{stem}.png"), cv2.IMREAD_GRAYSCALE)
+        rgb, mask = self.load(stem)
         h, w = mask.shape
         rng = np.random.default_rng(i if self.background_only else None)
 
@@ -130,6 +208,14 @@ class HandCrops(Dataset):
                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         msk = cv2.warpAffine(mask, m, (self.size, self.size), flags=cv2.INTER_LINEAR,
                              borderMode=cv2.BORDER_CONSTANT, borderValue=0) >= 128
+
+        if self.train and msk.any() and rng.random() < BACKGROUND_SWAP_P:
+            bg = self.random_background(rng)
+            if bg is not None:
+                # Hand stays, everything else (incl. the black out-of-frame padding) becomes the new scene.
+                k = 2 * SWAP_FEATHER_PX + 1
+                alpha = cv2.GaussianBlur(msk.astype(np.float32), (k, k), 0)[..., None]
+                img = (alpha * img + (1 - alpha) * bg).astype(np.uint8)
 
         if self.train:
             if rng.random() < 0.5:

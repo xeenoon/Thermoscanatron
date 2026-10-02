@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { FrameParser } from '../src/frame-parser.js';
-import { encodePacket, FRAME_WORDS, signedWord } from '../src/protocol.js';
+import { encodePacket, PIXEL_WORDS } from '../src/protocol.js';
 
 function fixture(sequence = 42) {
-  const words = Uint16Array.from({ length: FRAME_WORDS }, (_, index) => index * 17 & 0xffff);
-  return encodePacket({ sequence, timestampUs: 123456789n, subpage: sequence & 1, words });
+  const celsius = Float32Array.from({ length: PIXEL_WORDS }, (_, index) => 20 + index / 100);
+  return encodePacket({ sequence, timestampUs: 123456789n, subpage: sequence & 1, celsius, ambientC: 26.25 });
 }
 
 test('parses a firmware-format packet split across arbitrary serial chunks', () => {
@@ -17,7 +17,8 @@ test('parses a firmware-format packet split across arbitrary serial chunks', () 
   assert.equal(frames.length, 1);
   assert.equal(frames[0].sequence, 42);
   assert.equal(frames[0].timestampUs, 123456789n);
-  assert.equal(frames[0].words[767], 767 * 17);
+  assert.ok(Math.abs(frames[0].celsius[767] - 27.67) < 1e-4);
+  assert.equal(frames[0].ambientC, 26.25);
 });
 
 test('drops a corrupt packet and resynchronizes at the following frame', () => {
@@ -35,9 +36,12 @@ test('drops a corrupt packet and resynchronizes at the following frame', () => {
   assert.deepEqual(frames.map((frame) => frame.sequence), [5]);
 });
 
-test('converts raw MLX90640 words to signed pixel readings', () => {
-  assert.equal(signedWord(0x0001), 1);
-  assert.equal(signedWord(0x7fff), 32767);
-  assert.equal(signedWord(0xffff), -1);
-  assert.equal(signedWord(0x8000), -32768);
+test('round-trips negative temperatures', () => {
+  const frames = [];
+  const parser = new FrameParser({ onFrame: (frame) => frames.push(frame) });
+  const celsius = new Float32Array(PIXEL_WORDS).fill(-12.34);
+  parser.push(encodePacket({ sequence: 1, timestampUs: 0n, subpage: 0, celsius, ambientC: -5 }));
+
+  assert.ok(Math.abs(frames[0].celsius[0] + 12.34) < 1e-4);
+  assert.equal(frames[0].ambientC, -5);
 });

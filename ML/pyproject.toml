@@ -36,6 +36,9 @@ segkit-extract = "segkit.extract_frames:main"
 segkit-validate = "segkit.validate_dataset:main"
 segkit-train = "segkit.train:main"
 segkit-report = "segkit.report:main"
+segkit-diagnose = "segkit.diagnose:main"
+segkit-test = "segkit.test_set:main"
+segkit-negatives = "segkit.negatives:main"
 
 [tool.uv]
 conflicts = [[{ extra = "cpu" }, { extra = "cu130" }]]

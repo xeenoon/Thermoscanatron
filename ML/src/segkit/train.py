@@ -14,10 +14,11 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
-from segkit.datasets.hands import IMAGENET_MEAN, IMAGENET_STD, HandCrops, load_split
+from segkit.datasets.hands import (IMAGENET_MEAN, IMAGENET_STD, HandCrops, NegativeImages, load_split, read_list,
+                                   session_of)
 from segkit.eval.metrics import score
 from segkit.losses import bce_dice
 from segkit.models.handseg import HandSegNet, ProbabilityHead
@@ -87,6 +88,10 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--workers", type=int, default=12)
     p.add_argument("--limit", type=int, default=0, help="use only this many train/val samples (smoke test)")
+    p.add_argument("--negatives", type=Path, help="list of hand-free image paths (segkit-negatives) for training")
+    p.add_argument("--val-negatives", type=Path, help="held-out list of hand-free image paths for validation")
+    p.add_argument("--negative-share", type=float, default=0.25,
+                   help="share of each training epoch drawn from --negatives")
     p.add_argument("--no-pretrained", action="store_true")
     p.add_argument("--no-export", action="store_true")
     args = p.parse_args()
@@ -101,13 +106,32 @@ def main() -> None:
         return sum(not cv2.imread(str(args.dataset / "masks" / f"{s}.png"), cv2.IMREAD_GRAYSCALE).any() for s in stems)
     print(f"no-hand frames: train {n_no_hand(train_stems)}  val {n_no_hand(val_stems)}")
 
-    train_loader = DataLoader(HandCrops(args.dataset, train_stems, args.size, train=True), batch_size=args.batch,
-                              shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True,
+    # Every recording session gets the same weight per epoch, however many frames it has.
+    sessions = [session_of(s) for s in train_stems]
+    counts = {k: sessions.count(k) for k in set(sessions)}
+    print("train frames per session: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+    negatives = read_list(args.negatives)
+    weights = [1.0 / counts[k] for k in sessions]
+    train_set = HandCrops(args.dataset, train_stems, args.size, train=True, negatives=negatives)
+    if negatives:
+        # Hand frames keep their total weight; negatives get negative_share of the draws, spread evenly.
+        own = sum(weights)
+        neg_w = own * args.negative_share / (1 - args.negative_share) / len(negatives)
+        weights += [neg_w] * len(negatives)
+        train_set = ConcatDataset([train_set, NegativeImages(negatives, args.size, train=True)])
+        print(f"negatives: {len(negatives)} images, {args.negative_share:.0%} of draws, also used as paste backgrounds")
+    sampler = WeightedRandomSampler(weights, num_samples=len(train_stems), replacement=True)
+    train_loader = DataLoader(train_set, batch_size=args.batch,
+                              sampler=sampler, num_workers=args.workers, pin_memory=True, drop_last=True,
                               persistent_workers=args.workers > 0)
     # Validation: one centred crop per frame, plus a fixed background crop from every 2nd hand frame so the
     # "no hand" false-positive rate is measured on real cluttered backgrounds.
-    val_set = ConcatDataset([HandCrops(args.dataset, val_stems, args.size, train=False),
-                             HandCrops(args.dataset, val_stems[::2], args.size, train=False, background_only=True)])
+    val_parts = [HandCrops(args.dataset, val_stems, args.size, train=False),
+                 HandCrops(args.dataset, val_stems[::2], args.size, train=False, background_only=True)]
+    val_negatives = read_list(args.val_negatives)
+    if val_negatives:
+        val_parts.append(NegativeImages(val_negatives, args.size, train=False))
+    val_set = ConcatDataset(val_parts)
     val_loader = DataLoader(val_set, batch_size=args.batch, num_workers=args.workers, pin_memory=True)
 
     model = HandSegNet(pretrained=not args.no_pretrained).to(device)

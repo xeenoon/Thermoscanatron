@@ -1,11 +1,12 @@
-export const MAGIC = Buffer.from('THM1');
-export const VERSION = 1;
+export const MAGIC = Buffer.from('THM2');
+export const VERSION = 2;
 export const HEADER_BYTES = 28;
-export const FRAME_WORDS = 834;
 export const WIDTH = 32;
 export const HEIGHT = 24;
 export const PIXEL_WORDS = WIDTH * HEIGHT;
-export const PAYLOAD_BYTES = FRAME_WORDS * 2;
+// 768 pixel temperatures followed by the sensor ambient temperature, int16 centi-degrees C.
+export const PAYLOAD_WORDS = PIXEL_WORDS + 1;
+export const PAYLOAD_BYTES = PAYLOAD_WORDS * 2;
 export const PACKET_BYTES = HEADER_BYTES + PAYLOAD_BYTES;
 
 export function crc32(data) {
@@ -17,10 +18,6 @@ export function crc32(data) {
     }
   }
   return (crc ^ 0xffffffff) >>> 0;
-}
-
-export function signedWord(word) {
-  return word > 0x7fff ? word - 0x10000 : word;
 }
 
 export function decodePacket(packet) {
@@ -38,7 +35,7 @@ export function decodePacket(packet) {
   const height = packet.readUInt8(23);
   const expectedCrc = packet.readUInt32LE(24);
 
-  if (version !== VERSION || headerBytes !== HEADER_BYTES || wordCount !== FRAME_WORDS) {
+  if (version !== VERSION || headerBytes !== HEADER_BYTES || wordCount !== PAYLOAD_WORDS) {
     throw new Error('unsupported packet format');
   }
   if (width !== WIDTH || height !== HEIGHT || subpage > 1) {
@@ -51,16 +48,17 @@ export function decodePacket(packet) {
     throw new Error('payload CRC mismatch');
   }
 
-  const words = new Uint16Array(wordCount);
-  for (let index = 0; index < wordCount; index += 1) {
-    words[index] = payload.readUInt16LE(index * 2);
+  const celsius = new Float32Array(PIXEL_WORDS);
+  for (let index = 0; index < PIXEL_WORDS; index += 1) {
+    celsius[index] = payload.readInt16LE(index * 2) / 100;
   }
+  const ambientC = payload.readInt16LE(PIXEL_WORDS * 2) / 100;
 
-  return { version, subpage, sequence, timestampUs, width, height, words };
+  return { version, subpage, sequence, timestampUs, width, height, celsius, ambientC };
 }
 
-export function encodePacket({ sequence, timestampUs, subpage, words }) {
-  if (words.length !== FRAME_WORDS) throw new Error(`expected ${FRAME_WORDS} words`);
+export function encodePacket({ sequence, timestampUs, subpage, celsius, ambientC }) {
+  if (celsius.length !== PIXEL_WORDS) throw new Error(`expected ${PIXEL_WORDS} pixels`);
 
   const packet = Buffer.alloc(PACKET_BYTES);
   MAGIC.copy(packet);
@@ -69,12 +67,13 @@ export function encodePacket({ sequence, timestampUs, subpage, words }) {
   packet.writeUInt16LE(HEADER_BYTES, 6);
   packet.writeUInt32LE(sequence >>> 0, 8);
   packet.writeBigUInt64LE(BigInt(timestampUs), 12);
-  packet.writeUInt16LE(FRAME_WORDS, 20);
+  packet.writeUInt16LE(PAYLOAD_WORDS, 20);
   packet.writeUInt8(WIDTH, 22);
   packet.writeUInt8(HEIGHT, 23);
-  for (let index = 0; index < FRAME_WORDS; index += 1) {
-    packet.writeUInt16LE(words[index], HEADER_BYTES + index * 2);
+  for (let index = 0; index < PIXEL_WORDS; index += 1) {
+    packet.writeInt16LE(Math.round(celsius[index] * 100), HEADER_BYTES + index * 2);
   }
+  packet.writeInt16LE(Math.round(ambientC * 100), HEADER_BYTES + PIXEL_WORDS * 2);
   packet.writeUInt32LE(crc32(packet.subarray(HEADER_BYTES)), 24);
   return packet;
 }

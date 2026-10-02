@@ -10,7 +10,7 @@ uv run pytest               # unit tests
 
 ### Hand dataset (phone video -> frames -> rembg labels)
 
-Record with the Android app (`android-app/`, Record/Stop: silent 1080p video), then:
+Record with the Android app (`android-app/`, Options ▾ → Record video: silent 1080p video), then:
 
 ```bash
 adb pull /sdcard/Android/data/com.euhack.hello/files/videos data/      # -> data/videos/*.mp4

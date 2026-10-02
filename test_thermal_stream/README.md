@@ -1,6 +1,6 @@
 # Thermal stream test viewer
 
-Displays the raw 32×24 MLX90640 pixel words streamed by the QT Py firmware. A minimal C reader owns the serial device; Node only serves the image.
+Displays the calibrated 32×24 MLX90640 temperatures (°C) streamed by the QT Py firmware. A minimal C reader owns the serial device; Node only serves the image.
 
 ```sh
 npm install

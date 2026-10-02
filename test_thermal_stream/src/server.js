@@ -5,7 +5,6 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import { FrameParser } from './frame-parser.js';
-import { PIXEL_WORDS, signedWord } from './protocol.js';
 import { SimulatedSerial } from './simulator.js';
 
 const args = process.argv.slice(2);
@@ -53,7 +52,8 @@ const parser = new FrameParser({
       subpage: frame.subpage,
       width: frame.width,
       height: frame.height,
-      pixels: Array.from(frame.words.subarray(0, PIXEL_WORDS), signedWord),
+      ambientC: frame.ambientC,
+      pixels: Array.from(frame.celsius),
       frames,
       parseErrors,
     });
@@ -95,7 +95,7 @@ if (simulate) {
 
 server.listen(httpPort, () => {
   console.log(`Thermal viewer: http://localhost:${httpPort}`);
-  console.log(simulate ? 'Input: simulated THM1 stream' : `Input: ${serialPath}`);
+  console.log(simulate ? 'Input: simulated THM2 stream' : `Input: ${serialPath}`);
 });
 
 function shutdown() {

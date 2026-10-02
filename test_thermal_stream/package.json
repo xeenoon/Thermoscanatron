@@ -2,7 +2,7 @@
   "name": "test-thermal-stream",
   "version": "1.0.0",
   "private": true,
-  "description": "Raw MLX90640 serial stream viewer for the QT Py ESP32-S3 firmware",
+  "description": "MLX90640 temperature stream viewer for the QT Py ESP32-S3 firmware",
   "type": "module",
   "scripts": {
     "build-native": "cmake -S native -B native/build && cmake --build native/build",
