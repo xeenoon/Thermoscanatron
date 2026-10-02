@@ -16,6 +16,7 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pillow>=12.3.0",
     "pyyaml>=6.0.3",
+    "rembg[cpu]>=2.0.69",
     "segmentation-models-pytorch>=0.5.0",
     "tensorboard>=2.21.0",
     "timm>=1.0.30",
@@ -26,6 +27,9 @@ dependencies = [
 
 [project.scripts]
 segkit-hello-world = "segkit.hello_world:main"
+segkit-eval = "segkit.eval.cli:main"
+segkit-label = "segkit.label_rembg:main"
+segkit-extract = "segkit.extract_frames:main"
 
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cpu"
@@ -37,4 +41,5 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "jupyter>=1.1.1",
+    "pytest>=9.1.1",
 ]

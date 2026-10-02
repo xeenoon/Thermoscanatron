@@ -4,10 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
-import android.util.Size
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -18,13 +16,16 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
-import androidx.camera.core.resolutionselector.AspectRatioStrategy
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import java.io.File
@@ -33,40 +34,23 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Dataset capture: back-camera preview, one photo every [INTERVAL_S] seconds while running.
- * Photos land in <external files>/captures/<session>/ — pull them with adb (see README).
+ * Dataset capture: back-camera preview, Start/Stop records a silent 1080p video.
+ * Videos land in <external files>/videos/ — pull them with adb and extract frames on the desktop.
  */
 class MainActivity : ComponentActivity() {
     private lateinit var previewView: PreviewView
-    private lateinit var countdown: TextView
+    private lateinit var elapsed: TextView
     private lateinit var status: TextView
     private lateinit var toggle: Button
-    private lateinit var flash: View
 
-    private var imageCapture: ImageCapture? = null
-    private val handler = Handler(Looper.getMainLooper())
-    private var running = false
-    private var secondsLeft = INTERVAL_S
-    private var sessionDir: File? = null
-    private var captured = 0
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var recording: Recording? = null
+    private var recorded = 0
 
     private val requestCamera =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) startCamera() else status.text = "Camera permission denied"
         }
-
-    private val tick = object : Runnable {
-        override fun run() {
-            if (!running) return
-            secondsLeft -= 1
-            if (secondsLeft <= 0) {
-                takePhoto()
-                secondsLeft = INTERVAL_S
-            }
-            countdown.text = secondsLeft.toString()
-            handler.postDelayed(this, 1000)
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -82,20 +66,17 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        stopCapture()
+        stopRecording()
     }
 
     private fun buildLayout(): View {
         previewView = PreviewView(this).apply { scaleType = PreviewView.ScaleType.FIT_CENTER }
-        flash = View(this).apply {
-            setBackgroundColor(Color.WHITE)
-            alpha = 0f
-        }
-        countdown = TextView(this).apply {
-            textSize = 96f
-            setTextColor(Color.WHITE)
+        elapsed = TextView(this).apply {
+            textSize = 32f
+            setTextColor(Color.RED)
             setShadowLayer(8f, 0f, 0f, Color.BLACK)
-            gravity = Gravity.CENTER
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, 160, 0, 0)
             visibility = View.INVISIBLE
         }
         status = TextView(this).apply {
@@ -105,8 +86,8 @@ class MainActivity : ComponentActivity() {
             text = "Ready"
         }
         toggle = Button(this).apply {
-            text = "Start"
-            setOnClickListener { if (running) stopCapture() else startCapture() }
+            text = "Record"
+            setOnClickListener { if (recording != null) stopRecording() else startRecording() }
         }
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -122,8 +103,7 @@ class MainActivity : ComponentActivity() {
         return FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(previewView, FrameLayout.LayoutParams(-1, -1))
-            addView(countdown, FrameLayout.LayoutParams(-1, -1))
-            addView(flash, FrameLayout.LayoutParams(-1, -1))
+            addView(elapsed, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
             addView(bottom, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         }
     }
@@ -132,77 +112,61 @@ class MainActivity : ComponentActivity() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             val provider = providerFuture.get()
-            val resolution = ResolutionSelector.Builder()
-                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
-                .setResolutionStrategy(
-                    ResolutionStrategy(TARGET_SIZE, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
-                )
-                .build()
             val preview = Preview.Builder().build().also { it.surfaceProvider = previewView.surfaceProvider }
-            val capture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                .setResolutionSelector(resolution)
+            val recorder = Recorder.Builder()
+                .setQualitySelector(
+                    QualitySelector.from(Quality.FHD, FallbackStrategy.higherQualityOrLowerThan(Quality.FHD))
+                )
+                .setTargetVideoEncodingBitRate(BITRATE)
                 .build()
+            val capture = VideoCapture.withOutput(recorder)
             provider.unbindAll()
             provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, capture)
-            imageCapture = capture
-            status.text = "Ready — press Start"
+            videoCapture = capture
+            status.text = "Ready — press Record"
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun startCapture() {
-        if (imageCapture == null) return
+    private fun startRecording() {
+        val capture = videoCapture ?: return
+        val dir = File(getExternalFilesDir(null), "videos").apply { mkdirs() }
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        sessionDir = File(getExternalFilesDir(null), "captures/session_$stamp").apply { mkdirs() }
-        captured = 0
-        running = true
-        secondsLeft = INTERVAL_S
+        val file = File(dir, "hand_$stamp.mp4")
+        recording = capture.output
+            .prepareRecording(this, FileOutputOptions.Builder(file).build())
+            .start(ContextCompat.getMainExecutor(this)) { event -> onRecordEvent(event, file) }
         toggle.text = "Stop"
-        countdown.text = secondsLeft.toString()
-        countdown.visibility = View.VISIBLE
-        updateStatus()
-        handler.postDelayed(tick, 1000)
+        elapsed.visibility = View.VISIBLE
     }
 
-    private fun stopCapture() {
-        running = false
-        handler.removeCallbacks(tick)
-        countdown.visibility = View.INVISIBLE
-        toggle.text = "Start"
-        if (sessionDir != null) updateStatus()
+    private fun stopRecording() {
+        recording?.stop()
+        recording = null
+        toggle.text = "Record"
+        elapsed.visibility = View.INVISIBLE
     }
 
-    private fun takePhoto() {
-        val capture = imageCapture ?: return
-        val dir = sessionDir ?: return
-        val name = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-        val file = File(dir, "hand_$name.jpg")
-        capture.takePicture(
-            ImageCapture.OutputFileOptions.Builder(file).build(),
-            ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    captured += 1
-                    flash.alpha = 0.6f
-                    flash.animate().alpha(0f).setDuration(250).start()
-                    updateStatus()
+    private fun onRecordEvent(event: VideoRecordEvent, file: File) {
+        when (event) {
+            is VideoRecordEvent.Status -> {
+                val s = event.recordingStats.recordedDurationNanos / 1_000_000_000
+                elapsed.text = String.format(Locale.US, "● %d:%02d", s / 60, s % 60)
+            }
+            is VideoRecordEvent.Finalize -> {
+                if (event.hasError()) {
+                    Log.e(TAG, "recording error ${event.error}", event.cause)
+                    status.text = "Recording error ${event.error}: ${event.cause?.message}"
+                } else {
+                    recorded += 1
+                    status.text = "Saved ${file.name} (${file.length() / 1_000_000} MB) — $recorded this run"
                 }
-
-                override fun onError(e: ImageCaptureException) {
-                    Log.e(TAG, "capture failed", e)
-                    status.text = "Capture failed: ${e.message}"
-                }
-            },
-        )
-    }
-
-    private fun updateStatus() {
-        status.text = "${if (running) "Capturing" else "Stopped"} — $captured photos\n${sessionDir?.name}"
+            }
+            else -> Unit
+        }
     }
 
     companion object {
         private const val TAG = "HandCapture"
-        private const val INTERVAL_S = 5
-        private val TARGET_SIZE = Size(1920, 1440)
+        private const val BITRATE = 20_000_000  // high bitrate keeps finger edges free of compression mush
     }
 }

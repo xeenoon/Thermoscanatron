@@ -28,5 +28,5 @@ adb -d install -r app/build/outputs/apk/debug/app-debug.apk
 adb -d shell am start -n com.euhack.hello/.MainActivity
 ```
 
-The app is a dataset camera: press Start and it saves a photo every 5 s (countdown on screen) to
-`/sdcard/Android/data/com.euhack.hello/files/captures/session_<time>/`. See `ML/README.md` to pull and label them.
+The app is a dataset camera: Record/Stop saves a silent 1080p, 20 Mbps video to
+`/sdcard/Android/data/com.euhack.hello/files/videos/hand_<time>.mp4`. See `ML/README.md` to pull and label them.
