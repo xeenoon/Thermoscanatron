@@ -8,5 +8,12 @@ firmware/sdkconfig
 firmware/sdkconfig.old
 
 # Editor and operating-system noise.
+.vscode/
+.clangd
 .DS_Store
 *.swp
+
+# Android generated files.
+android-app/.gradle/
+android-app/local.properties
+android-app/app/build/
