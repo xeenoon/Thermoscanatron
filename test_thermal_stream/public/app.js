@@ -2,17 +2,8 @@ const canvas = document.querySelector('#thermal');
 const context = canvas.getContext('2d');
 
 function heatColor(value) {
-  const stops = [
-    [0, 32, 255],
-    [0, 210, 255],
-    [255, 235, 0],
-    [255, 24, 0],
-  ];
-  const scaled = Math.max(0, Math.min(0.9999, value)) * (stops.length - 1);
-  const index = Math.floor(scaled);
-  const mix = scaled - index;
-  return stops[index].map((channel, i) =>
-    Math.round(channel + (stops[index + 1][i] - channel) * mix));
+  const red = Math.round(Math.max(0, Math.min(1, value)) * 255);
+  return [red, 0, 255 - red];
 }
 
 function drawFrame(frame) {

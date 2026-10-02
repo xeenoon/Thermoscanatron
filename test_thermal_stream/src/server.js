@@ -1,8 +1,8 @@
-import { createReadStream } from 'node:fs';
+import { createReadStream, readdirSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SerialPort } from 'serialport';
+import { spawn } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import { FrameParser } from './frame-parser.js';
 import { PIXEL_WORDS, signedWord } from './protocol.js';
@@ -15,21 +15,17 @@ const valueAfter = (name) => {
 };
 
 if (args.includes('--list')) {
-  const ports = await SerialPort.list();
+  const ports = readdirSync('/dev')
+    .filter((name) => /^tty(?:ACM|USB)\d+$/.test(name))
+    .map((name) => `/dev/${name}`);
   if (ports.length === 0) console.log('No serial ports found.');
-  for (const port of ports) {
-    console.log([port.path, port.manufacturer, port.serialNumber].filter(Boolean).join('  '));
-  }
+  for (const port of ports) console.log(port);
   process.exit(0);
 }
 
 const simulate = args.includes('--simulate');
-const serialPath = valueAfter('--serial');
+const serialPath = valueAfter('--serial') ?? '/dev/ttyACM0';
 const httpPort = Number(valueAfter('--http-port') ?? process.env.PORT ?? 3000);
-if (!simulate && !serialPath) {
-  console.error('Pass --serial /dev/ttyACM0, use --list, or run with --simulate.');
-  process.exit(1);
-}
 
 const publicDirectory = fileURLToPath(new URL('../public', import.meta.url));
 const contentTypes = { '.css': 'text/css', '.html': 'text/html', '.js': 'text/javascript' };
@@ -74,11 +70,17 @@ sockets.on('connection', (socket) => {
   if (latestMessage) socket.send(latestMessage);
 });
 
-const source = simulate
-  ? new SimulatedSerial()
-  : new SerialPort({ path: serialPath, baudRate: 115200, autoOpen: true });
+const nativeReader = fileURLToPath(new URL('../native/build/thermal_serial', import.meta.url));
+const child = simulate ? undefined : spawn(nativeReader, [serialPath], {
+  stdio: ['ignore', 'pipe', 'inherit'],
+});
+const source = simulate ? new SimulatedSerial() : child.stdout;
 source.on('data', (chunk) => parser.push(chunk));
-source.on('error', (error) => console.error(`Serial error: ${error.message}`));
+source.on('error', (error) => console.error(`Stream error: ${error.message}`));
+child?.on('error', (error) => console.error(`Native reader error: ${error.message}`));
+child?.on('exit', (code, signal) => {
+  if (code !== 0 && signal === null) console.error(`Native reader exited with code ${code}`);
+});
 source.start?.();
 
 server.listen(httpPort, () => {
@@ -88,7 +90,7 @@ server.listen(httpPort, () => {
 
 function shutdown() {
   source.stop?.();
-  source.close?.();
+  child?.kill('SIGTERM');
   sockets.close();
   server.close(() => process.exit(0));
 }
