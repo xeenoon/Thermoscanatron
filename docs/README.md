@@ -7,7 +7,7 @@
 - [ESP32-S3 datasheet](qt-py-esp32-s3/esp32-s3-datasheet.pdf) — chip specifications and GPIO functions
 - [ESP32-S3 technical reference manual](qt-py-esp32-s3/esp32-s3-technical-reference-manual.pdf) — peripheral and register reference
 
-## MLX90640 thermal camera (ADA4407)
+## MLX90640 thermal camera (ADA4407, MLX90640-BAB: 55°×35° field of view)
 
 - [Adafruit product guide](mlx90640/adafruit-mlx90640-breakout-guide.pdf) — breakout pinouts, wiring, schematic, and fabrication drawing
 - [Melexis MLX90640 datasheet](mlx90640/mlx90640-datasheet.pdf) — sensor specifications, I2C protocol, registers, and EEPROM layout

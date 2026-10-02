@@ -39,4 +39,5 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.3")
     // Must match the executorch version that exported the .pte (ML/uv.lock: 1.5.1).
     implementation("org.pytorch:executorch-android:1.5.1")
+    testImplementation("junit:junit:4.13.2")
 }

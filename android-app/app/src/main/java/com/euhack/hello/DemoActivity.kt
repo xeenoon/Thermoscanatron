@@ -8,6 +8,8 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.hardware.camera2.CameraCharacteristics
 import android.os.Build
 import android.os.Bundle
@@ -16,6 +18,8 @@ import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.app.AlertDialog
+import android.widget.ProgressBar
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.PopupMenu
@@ -52,7 +56,10 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.sqrt
 
 /**
  * Live hand demo: the centred square of the camera frame goes through HandSegNet (ExecuTorch, XNNPACK),
@@ -64,8 +71,12 @@ import java.util.concurrent.Executors
  *    on one clock, for fitting the camera-to-thermal alignment;
  *  - Dump NO-HAND frames: [NoHandLogger] diagnostics;
  *  - Stream thermal input: shows only the USB thermal camera ([ThermalUsbStream]) full screen. The camera
- *    keeps running behind it so recording still captures both.
- * Whenever the thermal camera is plugged in, a small live thermal view sits in the corner of the camera view.
+ *    keeps running behind it so recording still captures both;
+ *  - Calibrate thermal ↔ camera: 5 s of the hand seen by both cameras -> [ThermalCalibration] finds where
+ *    the thermal camera sits (angles, offsets), shown in a popup and saved ([CalibrationStore]);
+ *  - Fused thermal view (once calibrated): only the part of the camera image the thermal camera also sees,
+ *    with temperatures upsampled along the camera's edges ([FusionRenderer]); the rest is black.
+ * Whenever the thermal camera is plugged in (and not fused), a small live thermal view sits in the corner.
  */
 class DemoActivity : ComponentActivity() {
     private lateinit var previewView: PreviewView
@@ -92,6 +103,29 @@ class DemoActivity : ComponentActivity() {
     private var thermal: ThermalUsbStream? = null
     private var thermalMode = false
     @Volatile private var thermalStatus = "Starting thermal input…"
+    @Volatile private var latestThermal: ThermalFrame? = null
+
+    private lateinit var fusedView: FusedView
+    private lateinit var calibProgress: ProgressBar
+    private lateinit var calibStore: CalibrationStore
+    @Volatile private var calibration: ThermalCalibration.Result? = null
+    @Volatile private var fusedMode = true
+    @Volatile private var fusedVisible = false
+    @Volatile private var fusedStatus = ""
+    private val fusion = FusionRenderer()
+    private val fusionExecutor = Executors.newSingleThreadExecutor()
+    private val fusionBusy = AtomicBoolean(false)
+    /** Phone camera focal length in sensor (active array) pixels, from Camera2; 0 until bound. */
+    @Volatile private var sensorFocalPx = 0.0
+
+    private enum class CalibState { OFF, COLLECTING, SOLVING }
+    @Volatile private var calibState = CalibState.OFF
+    private val calibCams = ArrayList<ThermalCalibration.CameraSample>()      // analysis thread only
+    private val calibThermals = ConcurrentLinkedQueue<ThermalCalibration.ThermalSample>()
+    @Volatile private var collectThermal = false
+    private var calibHandMs = 0L
+    @Volatile private var calibNeedsDepth = false
+    private var calibLastHandMs = 0L
     private var lastThermalMs = 0L
 
     private val requestCamera =
@@ -119,6 +153,13 @@ class DemoActivity : ComponentActivity() {
         sessions = SessionRecorder(getExternalFilesDir(null)!!)
         thermalView = ThermalView(this).apply { visibility = View.GONE }
         thermalInset = ThermalView(this).apply { visibility = View.GONE }
+        fusedView = FusedView(this, fusion).apply { visibility = View.GONE }
+        calibProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            visibility = View.GONE
+        }
+        calibStore = CalibrationStore(filesDir)
+        calibration = calibStore.load()
         recordingLabel = TextView(this).apply {
             textSize = 28f
             setTextColor(Color.RED)
@@ -133,12 +174,15 @@ class DemoActivity : ComponentActivity() {
         setContentView(FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(previewView, FrameLayout.LayoutParams(-1, -1))
+            addView(fusedView, FrameLayout.LayoutParams(-1, -1))
             addView(outlineView, FrameLayout.LayoutParams(-1, -1))
             addView(thermalView, FrameLayout.LayoutParams(-1, -1))
             addView(thermalInset, FrameLayout.LayoutParams(INSET_W, INSET_W * 3 / 4, Gravity.TOP or Gravity.END)
                 .apply { topMargin = 330; rightMargin = 24 })
             addView(status, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = 120 })
-            addView(recordingLabel, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = 260 })
+            addView(calibProgress, FrameLayout.LayoutParams(-1, -2, Gravity.TOP)
+                .apply { topMargin = 300; leftMargin = 48; rightMargin = 48 })
+            addView(recordingLabel, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = 360 })
             addView(options, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
                 .apply { bottomMargin = 200 })
         })
@@ -173,11 +217,21 @@ class DemoActivity : ComponentActivity() {
                 isCheckable = true
                 isChecked = thermalMode
             }
+            menu.add(0, MENU_CALIBRATE, 3, "Calibrate thermal ↔ camera").apply {
+                isEnabled = calibState == CalibState.OFF
+            }
+            menu.add(0, MENU_FUSED, 4, "Fused thermal view").apply {
+                isCheckable = true
+                isChecked = fusedMode && calibration != null
+                isEnabled = calibration != null
+            }
             setOnMenuItemClickListener { item ->
                 when (item.itemId) {
                     MENU_RECORD -> if (sessions.active) stopRecording() else startRecording()
                     MENU_DUMP -> setLogging(!logger.enabled)
                     MENU_THERMAL -> setThermalMode(!thermalMode)
+                    MENU_CALIBRATE -> startCalibration()
+                    MENU_FUSED -> fusedMode = !fusedMode
                 }
                 true
             }
@@ -255,7 +309,7 @@ class DemoActivity : ComponentActivity() {
             .put("created", stamp)
             .put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
             .put("model_asset", MODEL_ASSET)
-            .put("thermal_sensor", "MLX90640 110x75 deg, taped to the back of the phone")
+            .put("thermal_sensor", "MLX90640-BAB (Adafruit 4407) 55x35 deg, taped to the back of the phone")
         val info = camera?.cameraInfo ?: return meta
         val c2 = Camera2CameraInfo.from(info)
         fun floats(values: FloatArray?) = values?.let { JSONArray(it.map { v -> v.toDouble() }) }
@@ -281,6 +335,217 @@ class DemoActivity : ComponentActivity() {
             if (c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
                 CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) "realtime" else "unknown")
         return meta.put("camera", cam)
+    }
+
+    // ------------------------------------------------------------------------------------ calibration
+
+    private fun thermalLive(): Boolean =
+        latestThermal?.let { SystemClock.elapsedRealtimeNanos() - it.receivedNs < 1_500_000_000L } ?: false
+
+    private fun startCalibration() {
+        if (calibState != CalibState.OFF) return
+        if (!thermalLive()) {
+            status.text = "Plug in the thermal camera first"
+            return
+        }
+        setThermalMode(false)
+        analysisExecutor.execute {
+            calibCams.clear()
+            calibHandMs = 0L
+            calibLastHandMs = 0L
+            calibNeedsDepth = false
+        }
+        calibThermals.clear()
+        collectThermal = true
+        calibState = CalibState.COLLECTING
+        calibProgress.isIndeterminate = false
+        calibProgress.progress = 0
+        calibProgress.visibility = View.VISIBLE
+        status.setTextColor(Color.WHITE)
+        status.text = CALIBRATE_PROMPT
+    }
+
+    /** Analysis thread: keep frames where both cameras see the hand; 5 s of them completes the capture. */
+    private fun collectCalibration(tsNs: Long, mask: FloatArray, left: Int, top: Int, side: Int,
+                                   cam: CameraIntrinsics, handVisible: Boolean, nowMs: Long) {
+        val sample = if (handVisible && thermalLive())
+            ThermalCalibration.cameraSample(tsNs, mask, SIZE, left, top, side, cam) else null
+        if (sample == null) {
+            calibLastHandMs = 0L
+            return
+        }
+        calibCams.add(sample)
+        if (calibLastHandMs > 0) calibHandMs += minOf(nowMs - calibLastHandMs, 200L)
+        calibLastHandMs = nowMs
+        // Parallax separates tilt from offset, so the capture also needs the hand near and far: after 5 s it
+        // keeps going until the depth spread is there (or 15 s have passed).
+        val spread = ThermalCalibration.depthSpread(calibCams)
+        val needDepth = calibHandMs >= CALIBRATION_MS && spread < MIN_DEPTH_SPREAD
+        calibNeedsDepth = needDepth
+        val progress = if (!needDepth) (calibHandMs * 1000 / CALIBRATION_MS).toInt().coerceAtMost(1000)
+            else (900 + 100 * (spread - 1) / (MIN_DEPTH_SPREAD - 1)).toInt().coerceAtMost(999)
+        runOnUiThread { calibProgress.progress = progress }
+        if (calibHandMs >= CALIBRATION_MS && (!needDepth || calibHandMs >= MAX_CALIBRATION_MS)) {
+            calibState = CalibState.SOLVING
+            val cams = ArrayList(calibCams)
+            Thread({ solveCalibration(cams) }, "calibration").start()
+        }
+    }
+
+    private fun solveCalibration(cams: List<ThermalCalibration.CameraSample>) {
+        runOnUiThread { status.text = "Calibrating — solving for the thermal camera's position…" }
+        // Thermal packets arrive a few hundred ms after the matching camera frame: wait for the last ones.
+        SystemClock.sleep(600)
+        collectThermal = false
+        val thermals = calibThermals.toList()
+        val camera = cams.firstOrNull()?.let { intrinsicsForCalibration } ?: return finishCalibration(null)
+        val result = try {
+            ThermalCalibration.solve(cams, thermals, camera) { p ->
+                runOnUiThread { calibProgress.progress = (p * 1000).toInt() }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "calibration failed", e)
+            null
+        }
+        finishCalibration(result)
+    }
+
+    @Volatile private var intrinsicsForCalibration: CameraIntrinsics? = null
+
+    private fun finishCalibration(result: ThermalCalibration.Result?) = runOnUiThread {
+        calibState = CalibState.OFF
+        calibProgress.visibility = View.GONE
+        val dialog = AlertDialog.Builder(this)
+        if (result == null) {
+            dialog.setTitle("Not enough data")
+                .setMessage("Both cameras need to see your hand for 5 seconds. Keep it inside the box, " +
+                    "in front of the thermal camera, and move it around slowly.")
+                .setPositiveButton("Retry") { _, _ -> startCalibration() }
+                .setNegativeButton("Cancel", null)
+        } else {
+            val good = result.correlation >= 0.6
+            dialog.setTitle(if (good) "Calibrated" else "Calibration looks poor")
+                .setMessage(CalibrationStore.describe(result) + if (good) "" else
+                    "\n\nTry again with your hand filling more of the box, moving nearer and further.")
+                .setPositiveButton("Use it") { _, _ ->
+                    calibStore.save(result)
+                    calibration = result
+                    fusedMode = true
+                }
+                .setNeutralButton("Retry") { _, _ -> startCalibration() }
+                .setNegativeButton("Cancel", null)
+        }
+        dialog.show().findViewById<TextView>(android.R.id.message)?.apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 13f
+        }
+    }
+
+    /** Phone camera intrinsics for the upright frame, from Camera2 and CameraX's sensor-to-buffer transform. */
+    private fun intrinsics(sensorToBuffer: FloatArray, frameW: Int, frameH: Int, bufferW: Int): CameraIntrinsics {
+        val f = if (sensorFocalPx > 0) sensorFocalPx * sensorToBuffer[0]
+            else bufferW / 2 / Math.tan(Math.toRadians(65.0 / 2))      // typical phone main camera
+        return CameraIntrinsics(f, frameW / 2.0, frameH / 2.0)
+    }
+
+    @OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun readFocalLength() {
+        val info = camera?.cameraInfo ?: return
+        val c2 = Camera2CameraInfo.from(info)
+        val focal = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+        val size = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val pixels = c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+        if (focal != null && size != null && pixels != null) sensorFocalPx = focal.toDouble() / size.width * pixels.width
+    }
+
+    /**
+     * Thermal veto for the hand model's false positives (cluttered or blurred scenes it calls "hand"): a hand
+     * is warm. Calibrated: the thermal pixels under the mask must be >= [VETO_DELTA_C] above the scene's 30th
+     * percentile (on the recorded session this rejected 20 of 22 confirmed false positives and kept ~94% of
+     * real hands). Uncalibrated or calibrating: something in the thermal view must be warm at all. Without a
+     * live thermal camera, or if the hand is outside the thermal view, the model's answer stands.
+     */
+    private fun thermalAgrees(mask: FloatArray, left: Int, top: Int, side: Int, cam: CameraIntrinsics): Boolean {
+        if (!thermalLive()) return true
+        val t = latestThermal?.celsius ?: return true
+        val cal = calibration
+        if (cal == null || calibState != CalibState.OFF) return ThermalCalibration.warmth(t) != null
+        var above = 0
+        for (p in mask) if (p > 0.5f) above++
+        val areaPx = above.toDouble() / mask.size * side * side
+        if (areaPx < 500) return true
+        val z = cam.f * sqrt(ThermalCalibration.HAND_AREA_CM2 / areaPx)
+        val uv = DoubleArray(2)
+        val temps = ArrayList<Float>()
+        for (gy in 0 until VETO_GRID) for (gx in 0 until VETO_GRID) {
+            val mx = ((gx + 0.5) / VETO_GRID * SIZE).toInt()
+            val my = ((gy + 0.5) / VETO_GRID * SIZE).toInt()
+            if (mask[my * SIZE + mx] <= 0.5f) continue
+            val fx = left + (gx + 0.5) / VETO_GRID * side
+            val fy = top + (gy + 0.5) / VETO_GRID * side
+            cal.pose.project((fx - cam.cx) / cam.f * z, (fy - cam.cy) / cam.f * z, z, uv)
+            val u = Math.round(uv[0]).toInt()
+            val v = Math.round(uv[1]).toInt()
+            if (u in 0 until ThermalGeometry.W && v in 0 until ThermalGeometry.H) temps.add(t[v * ThermalGeometry.W + u])
+        }
+        if (temps.size < 3) return true
+        val sorted = t.sortedArray()
+        val scene = sorted[(sorted.size * 0.3f).toInt()]
+        return temps.sorted()[temps.size / 2] - scene >= VETO_DELTA_C
+    }
+
+    // ------------------------------------------------------------------------------------ fusion
+
+    /** Analysis thread: hand the frame to the fusion thread unless it is still busy with the last one. */
+    private fun renderFused(frame: Bitmap, mask: FloatArray, handVisible: Boolean, left: Int, top: Int, side: Int,
+                            cam: CameraIntrinsics) {
+        val cal = calibration ?: return
+        val thermalFrame = latestThermal ?: return
+        if (!fusionBusy.compareAndSet(false, true)) return
+        var depth = FusionRenderer.DEFAULT_DEPTH_CM
+        var hand: FloatArray? = null
+        if (handVisible) {
+            var above = 0
+            for (p in mask) if (p > 0.5f) above++
+            val areaPx = above.toDouble() / mask.size * side * side
+            if (areaPx > 500) {
+                depth = cam.f * sqrt(ThermalCalibration.HAND_AREA_CM2 / areaPx)
+                hand = mask.copyOf()
+            }
+        }
+        fusionExecutor.execute {
+            try {
+                val st = fusion.render(frame, thermalFrame, cal.pose, cam, depth, hand, SIZE, left, top, side)
+                fusedView.update(frame.width, frame.height)
+                fusedStatus = String.format(Locale.US, "%s%.1f–%.1f °C",
+                    st.handC?.let { String.format(Locale.US, "HAND %.1f °C   |   ", it) } ?: "", st.lowC, st.highC)
+            } finally {
+                fusionBusy.set(false)
+            }
+        }
+    }
+
+    /** Draws the fused bitmap with the same FIT_CENTER placement as the preview and [OutlineOverlay]. */
+    class FusedView(context: Context, private val fusion: FusionRenderer) : View(context) {
+        private val paint = Paint().apply { isFilterBitmap = true }
+        private val dst = RectF()
+        @Volatile private var frameW = 0
+        @Volatile private var frameH = 0
+
+        fun update(w: Int, h: Int) {
+            frameW = w
+            frameH = h
+            postInvalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            if (frameW == 0) return
+            val scale = minOf(width.toFloat() / frameW, height.toFloat() / frameH)
+            val w = frameW * scale
+            val h = frameH * scale
+            dst.set((width - w) / 2, (height - h) / 2, (width + w) / 2, (height + h) / 2)
+            synchronized(fusion.bitmap) { canvas.drawBitmap(fusion.bitmap, null, dst, paint) }
+        }
     }
 
     /** Thermal mode shows only the thermal stream; the camera keeps running (hidden) for recording. */
@@ -315,8 +580,10 @@ class DemoActivity : ComponentActivity() {
 
     /** Called on the USB thread. */
     private fun onThermalFrame(frame: ThermalFrame) {
+        latestThermal = frame
+        if (collectThermal) calibThermals.add(ThermalCalibration.ThermalSample(frame.receivedNs, frame.celsius))
         sessions.onThermalFrame(frame)
-        if (!thermalMode) {
+        if (!thermalMode && !fusedVisible) {
             thermalInset.update(frame)
             if (thermalInset.visibility != View.VISIBLE) runOnUiThread { if (!thermalMode) thermalInset.visibility = View.VISIBLE }
         }
@@ -390,6 +657,7 @@ class DemoActivity : ComponentActivity() {
             camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
             null
         }
+        readFocalLength()
     }
 
     private fun analyze(image: ImageProxy) {
@@ -433,18 +701,40 @@ class DemoActivity : ComponentActivity() {
         val now = SystemClock.elapsedRealtime()
         val fps = if (lastFrameMs > 0) 1000f / (now - lastFrameMs) else 0f
         lastFrameMs = now
-        val handVisible = present > PRESENT_THRESHOLD
+        val cam = intrinsics(sensorToBuffer, frame.width, frame.height, bufferW)
+        val modelHand = present > PRESENT_THRESHOLD
+        val vetoed = modelHand && !thermalAgrees(mask, left, top, side, cam)
+        val handVisible = modelHand && !vetoed
         outlineView.update(frame.width, frame.height, left, top, side, if (handVisible) edgePoints(mask) else null)
         logger.onFrame(now, crop, input, mask, present, inferMs, handVisible, frame.width, frame.height, rotation)
         sessions.onCameraFrame(sensorTsNs, analysisNs, frame.width, frame.height, rotation, left, top, side, crop,
             mask, present, handVisible, inferMs, sensorToBuffer, bufferW, bufferH)
+
+        intrinsicsForCalibration = cam
+        val state = calibState
+        if (state == CalibState.COLLECTING) collectCalibration(sensorTsNs, mask, left, top, side, cam, handVisible, now)
+        val showFused = calibration != null && fusedMode && !thermalMode && state == CalibState.OFF && thermalLive()
+        if (showFused) renderFused(frame, mask, handVisible, left, top, side, cam)
+
         val logging = if (logger.enabled) "   |   ${logger.dumpCount} dumped" else ""
         runOnUiThread {
             updateRecordingLabel()
-            if (thermalMode) return@runOnUiThread
+            if (showFused != fusedVisible) {
+                fusedVisible = showFused
+                fusedView.visibility = if (showFused) View.VISIBLE else View.GONE
+                if (showFused) thermalInset.visibility = View.GONE
+            }
+            if (thermalMode || state == CalibState.SOLVING) return@runOnUiThread
+            if (state == CalibState.COLLECTING) {
+                status.text = (if (calibNeedsDepth) DEPTH_PROMPT else CALIBRATE_PROMPT) +
+                    if (handVisible) "" else "\n(no hand seen)"
+                status.setTextColor(if (handVisible) Color.GREEN else Color.WHITE)
+                return@runOnUiThread
+            }
+            val fused = if (showFused) "$fusedStatus   |   " else ""
             status.text = String.format(
-                Locale.US, "%s  %.2f   |   %d ms model   |   %.0f fps%s",
-                if (handVisible) "HAND" else "NO HAND", present, inferMs, fps, logging,
+                Locale.US, "%s%s  %.2f   |   %d ms   |   %.0f fps%s",
+                fused, if (handVisible) "HAND" else if (vetoed) "NOT WARM" else "NO HAND", present, inferMs, fps, logging,
             )
             status.setTextColor(if (handVisible) Color.GREEN else Color.WHITE)
         }
@@ -550,6 +840,16 @@ class DemoActivity : ComponentActivity() {
         private const val MENU_RECORD = 1
         private const val MENU_DUMP = 2
         private const val MENU_THERMAL = 3
+        private const val MENU_CALIBRATE = 4
+        private const val MENU_FUSED = 5
+        private const val CALIBRATION_MS = 5000L
+        private const val MAX_CALIBRATION_MS = 15000L
+        private const val MIN_DEPTH_SPREAD = 1.35
+        private const val DEPTH_PROMPT = "Almost there: move your hand closer to the phone, then further away"
+        private const val VETO_GRID = 24
+        private const val VETO_DELTA_C = 2.5f
+        private const val CALIBRATE_PROMPT = "Hold your hand up inside the box to calibrate\n" +
+            "Move it around slowly, nearer and further"
         private const val INSET_W = 360
         private val MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val STD = floatArrayOf(0.229f, 0.224f, 0.225f)
