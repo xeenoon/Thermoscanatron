@@ -1,0 +1,12 @@
+# ESP-IDF and third-party dependencies are installed locally.
+firmware/dependencies/
+firmware/managed_components/
+
+# ESP-IDF generated files.
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# Editor and operating-system noise.
+.DS_Store
+*.swp

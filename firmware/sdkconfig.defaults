@@ -1,0 +1,10 @@
+# Adafruit QT Py ESP32-S3 (ADA5700)
+CONFIG_IDF_TARGET="esp32s3"
+
+# Use the board's native USB connection for application logs.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+
+# Keep development builds diagnosable.
+CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
