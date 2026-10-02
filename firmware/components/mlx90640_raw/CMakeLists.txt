@@ -1,7 +1,7 @@
 idf_component_register(
-    SRCS "application.c"
+    SRCS "mlx90640_raw.c"
     INCLUDE_DIRS "include"
-    REQUIRES board_qtpy_esp32s3 esp_common freertos log thermal_stream
+    REQUIRES esp_common esp_driver_i2c freertos
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

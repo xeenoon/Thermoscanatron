@@ -1,0 +1,7 @@
+#ifndef BOARD_CONFIG_H
+#define BOARD_CONFIG_H
+
+#define BOARD_STEMMA_SDA_GPIO 41
+#define BOARD_STEMMA_SCL_GPIO 40
+
+#endif

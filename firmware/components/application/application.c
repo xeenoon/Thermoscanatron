@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "thermal_stream.h"
 
 #define HEARTBEAT_PERIOD_MS 1000U
 #define HEARTBEAT_TASK_STACK_BYTES 3072U
@@ -44,5 +45,9 @@ esp_err_t application_start(void)
         HEARTBEAT_TASK_PRIORITY,
         NULL);
 
-    return created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+    if (created != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    return thermal_stream_start();
 }
