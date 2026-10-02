@@ -2,7 +2,8 @@
 
 ```bash
 cd ML
-uv sync
+uv sync --extra cpu          # laptop (CPU torch); GPU box: uv sync --extra cu130
+# always pass the same --extra to `uv run`; plain `uv run` installs the CUDA build
 uv run segkit-hello-world   # imports every dependency, runs one small op each; ends with "HELLO WORLD OK"
 uv run pytest               # unit tests
 ```
@@ -15,7 +16,9 @@ Record with the Android app (`android-app/`, Record/Stop: silent 1080p video), t
 adb pull /sdcard/Android/data/com.euhack.hello/files/videos data/      # -> data/videos/*.mp4
 uv run segkit-extract data/videos --out data/captures --fps 3          # sharpest frame per 1/3 s window
 uv run segkit-label data/captures --out data/hands_v1                  # resumable; --limit 5 to try first
-# data/hands_v1/{images,masks,overlays}/ + index.csv (flags: area, multi_component, blurry)
+uv run segkit-validate data/hands_v1                                   # checks + review/sheet_NN.jpg
+# data/hands_v1/{images,masks,overlays}/ + index.csv (flags: area, extra_blobs, blurry)
+# data/hands_v1/exclude.txt: stems rejected in manual review (skipped by training)
 # --model isnet-general-use is ~10x faster on CPU, birefnet-general-lite (default) has better edges
 ```
 
@@ -34,7 +37,7 @@ uv run segkit-eval score data/eval <pred_dir> --csv runs/scores.csv
 
 ## Dependencies
 
-Python 3.12 (managed by `uv`), CPU PyTorch wheels from `download.pytorch.org/whl/cpu`.
+Python 3.12 (managed by `uv`), PyTorch from `download.pytorch.org/whl/cpu` or `/whl/cu130` (extra `cpu` / `cu130`).
 
 - torch, torchvision
 - timm

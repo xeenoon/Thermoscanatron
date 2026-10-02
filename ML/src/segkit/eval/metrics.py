@@ -39,6 +39,9 @@ def score(pred: np.ndarray, gt: np.ndarray, ignore: np.ndarray | None = None) ->
     bp, bg = boundary(pred), boundary(gt)
     d_pred = distance_to(bg)[bp & keep]  # each predicted edge pixel -> nearest true edge
     d_gt = distance_to(bp)[bg & keep]    # each true edge pixel -> nearest predicted edge
+    # An empty prediction (or label) has no edge to measure against: count it as the worst possible error.
+    diagonal = float(np.hypot(*gt.shape))
+    d_pred, d_gt = np.minimum(d_pred, diagonal), np.minimum(d_gt, diagonal)
     pooled = np.concatenate([d_pred, d_gt])
     if pooled.size == 0:
         return Scores(iou, 0.0, 0.0, 0.0, {t: 1.0 for t in F_THRESHOLDS_PX})

@@ -20,19 +20,45 @@ dependencies = [
     "segmentation-models-pytorch>=0.5.0",
     "tensorboard>=2.21.0",
     "timm>=1.0.30",
-    "torch>=2.14.1",
-    "torchvision>=0.29.1",
     "tqdm>=4.66.5",
 ]
+
+# Pick the torch build per machine: `uv sync --extra cpu` (laptop) or `uv sync --extra cu130` (NVIDIA GPU).
+[project.optional-dependencies]
+cpu = ["torch>=2.14.1", "torchvision>=0.29.1"]
+cu130 = ["torch>=2.14.1", "torchvision>=0.29.1"]
 
 [project.scripts]
 segkit-hello-world = "segkit.hello_world:main"
 segkit-eval = "segkit.eval.cli:main"
 segkit-label = "segkit.label_rembg:main"
 segkit-extract = "segkit.extract_frames:main"
+segkit-validate = "segkit.validate_dataset:main"
+segkit-train = "segkit.train:main"
+segkit-report = "segkit.report:main"
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cu130" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
 
 [[tool.uv.index]]
+name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]

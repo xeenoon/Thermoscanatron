@@ -81,3 +81,10 @@ def test_load_label_with_hole_and_ignore(tmp_path):
     assert not lab.hand[50, 50] and lab.hand[20, 20]
     assert lab.ignore.sum() == 20 * 120
     assert lab.image_path.exists()
+
+
+def test_empty_prediction_is_worst_case_not_nan():
+    gt = disk((100, 100), (50, 50), 20)
+    s = score(np.zeros_like(gt), gt)
+    assert s.iou == 0.0 and s.f_at[2] == 0.0
+    assert s.p95_px == pytest.approx(np.hypot(100, 100))

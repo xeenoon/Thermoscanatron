@@ -13,6 +13,11 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
+        ndk { abiFilters += "arm64-v8a" }  // phones only; drops the x86_64 ExecuTorch libs
+    }
+
+    androidResources {
+        noCompress += "pte"  // the model is copied out of the APK as-is
     }
 
     compileOptions {
@@ -32,4 +37,6 @@ dependencies {
     implementation("androidx.camera:camera-view:$camerax")
     implementation("androidx.camera:camera-video:$camerax")
     implementation("androidx.activity:activity-ktx:1.9.3")
+    // Must match the executorch version that exported the .pte (ML/uv.lock: 1.5.1).
+    implementation("org.pytorch:executorch-android:1.5.1")
 }
