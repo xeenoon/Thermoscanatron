@@ -71,17 +71,27 @@ sockets.on('connection', (socket) => {
 });
 
 const nativeReader = fileURLToPath(new URL('../native/build/thermal_serial', import.meta.url));
-const child = simulate ? undefined : spawn(nativeReader, [serialPath], {
-  stdio: ['ignore', 'pipe', 'inherit'],
-});
-const source = simulate ? new SimulatedSerial() : child.stdout;
-source.on('data', (chunk) => parser.push(chunk));
-source.on('error', (error) => console.error(`Stream error: ${error.message}`));
-child?.on('error', (error) => console.error(`Native reader error: ${error.message}`));
-child?.on('exit', (code, signal) => {
-  if (code !== 0 && signal === null) console.error(`Native reader exited with code ${code}`);
-});
-source.start?.();
+let child;
+let stopping = false;
+
+function startNativeReader() {
+  child = spawn(nativeReader, [serialPath], { stdio: ['ignore', 'pipe', 'inherit'] });
+  child.stdout.on('data', (chunk) => parser.push(chunk));
+  child.stdout.on('error', (error) => console.error(`Stream error: ${error.message}`));
+  child.on('error', (error) => console.error(`Native reader error: ${error.message}`));
+  child.on('exit', () => {
+    if (!stopping) setTimeout(startNativeReader, 250);
+  });
+}
+
+let simulator;
+if (simulate) {
+  simulator = new SimulatedSerial();
+  simulator.on('data', (chunk) => parser.push(chunk));
+  simulator.start();
+} else {
+  startNativeReader();
+}
 
 server.listen(httpPort, () => {
   console.log(`Thermal viewer: http://localhost:${httpPort}`);
@@ -89,7 +99,8 @@ server.listen(httpPort, () => {
 });
 
 function shutdown() {
-  source.stop?.();
+  stopping = true;
+  simulator?.stop();
   child?.kill('SIGTERM');
   sockets.close();
   server.close(() => process.exit(0));
