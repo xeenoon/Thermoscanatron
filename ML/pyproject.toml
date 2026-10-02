@@ -16,17 +16,18 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pillow>=12.3.0",
     "pyyaml>=6.0.3",
-    "rembg[cpu]>=2.0.69",
+    "rembg>=2.0.69",
     "segmentation-models-pytorch>=0.5.0",
     "tensorboard>=2.21.0",
     "timm>=1.0.30",
     "tqdm>=4.66.5",
 ]
 
-# Pick the torch build per machine: `uv sync --extra cpu` (laptop) or `uv sync --extra cu130` (NVIDIA GPU).
+# Pick the torch + onnxruntime builds per machine: `uv sync --extra cpu` (laptop) or `uv sync --extra cu130`
+# (NVIDIA GPU). onnxruntime and onnxruntime-gpu install the same package dir, so only one may be present.
 [project.optional-dependencies]
-cpu = ["torch>=2.14.1", "torchvision>=0.29.1"]
-cu130 = ["torch>=2.14.1", "torchvision>=0.29.1"]
+cpu = ["torch>=2.14.1", "torchvision>=0.29.1", "rembg[cpu]>=2.0.69"]
+cu130 = ["torch>=2.14.1", "torchvision>=0.29.1", "rembg[gpu]>=2.0.69"]
 
 [project.scripts]
 segkit-hello-world = "segkit.hello_world:main"
