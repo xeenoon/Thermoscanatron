@@ -1,0 +1,40 @@
+[project]
+name = "segkit"
+version = "0.1.0"
+description = "ROI-crop segmentation models (HandSegNet, later PanelSegNet) for on-phone inference"
+readme = "README.md"
+authors = [
+    { name = "xeenoon", email = "ccw100asdf@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "albumentations>=2.0.8",
+    "executorch>=1.5.1",
+    "matplotlib>=3.11.2",
+    "mediapipe>=1.0.1",
+    "numpy>=2.5.2",
+    "opencv-python>=5.0.0.93",
+    "pillow>=12.3.0",
+    "pyyaml>=6.0.3",
+    "segmentation-models-pytorch>=0.5.0",
+    "tensorboard>=2.21.0",
+    "timm>=1.0.30",
+    "torch>=2.14.1",
+    "torchvision>=0.29.1",
+    "tqdm>=4.66.5",
+]
+
+[project.scripts]
+segkit-hello-world = "segkit.hello_world:main"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cpu"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+]
