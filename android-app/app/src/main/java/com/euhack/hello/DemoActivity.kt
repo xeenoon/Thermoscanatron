@@ -204,7 +204,7 @@ class DemoActivity : ComponentActivity() {
         analysisExecutor.execute {
             try {
                 hands = HandTwoTier(assetFilePath(this, SMALL_MODEL_ASSET), assetFilePath(this, MODEL_ASSET), SIZE,
-                    SMALL_SIZE)
+                    SMALL_SIZE, prevMaskInput = false)
                 runOnUiThread { status.text = "Model loaded — hold your hand in the box" }
             } catch (e: Exception) {
                 Log.e(TAG, "model load failed", e)
@@ -540,7 +540,7 @@ class DemoActivity : ComponentActivity() {
         val cal = calibration
         if (cal == null || calibState != CalibState.OFF) return ThermalCalibration.warmth(t) != null
         var above = 0
-        for (p in mask) if (p > 0.5f) above++
+        for (p in mask) if (p > MASK_THRESHOLD) above++
         val areaPx = above.toDouble() / mask.size * side * side
         if (areaPx < 500) return true
         val z = cam.f * sqrt(ThermalCalibration.HAND_AREA_CM2 / areaPx)
@@ -549,7 +549,7 @@ class DemoActivity : ComponentActivity() {
         for (gy in 0 until VETO_GRID) for (gx in 0 until VETO_GRID) {
             val mx = ((gx + 0.5) / VETO_GRID * n).toInt()
             val my = ((gy + 0.5) / VETO_GRID * n).toInt()
-            if (mask[my * n + mx] <= 0.5f) continue
+            if (mask[my * n + mx] <= MASK_THRESHOLD) continue
             val fx = left + (gx + 0.5) / VETO_GRID * side
             val fy = top + (gy + 0.5) / VETO_GRID * side
             cal.pose.project((fx - cam.cx) / cam.f * z, (fy - cam.cy) / cam.f * z, z, uv)
@@ -574,7 +574,7 @@ class DemoActivity : ComponentActivity() {
         var hand: FloatArray? = null
         if (handVisible) {
             var above = 0
-            for (p in mask) if (p > 0.5f) above++
+            for (p in mask) if (p > MASK_THRESHOLD) above++
             val areaPx = above.toDouble() / mask.size * side * side
             if (areaPx > 500) {
                 // The area-based depth jitters frame to frame; smooth it so the hand mapping does not wobble.
@@ -891,7 +891,7 @@ class DemoActivity : ComponentActivity() {
             val fused = if (showFused) "$fusedStatus   |   " else ""
             status.text = String.format(
                 Locale.US, "%s%s  %.2f   |   frame %d ms (prep %d, small %d, big %d bg)   |   %.0f fps%s",
-                fused, if (handVisible) "HAND" else if (vetoed) "NOT WARM" else "NO HAND", present,
+                fused, if (handVisible) "SKIN" else if (vetoed) "NOT WARM" else "NO SKIN", present,
                 timing[5] / 16, timing[0] / 16, inferMs, result.bigMs, fps, logging,
             )
             status.setTextColor(if (handVisible) Color.GREEN else Color.WHITE)
@@ -911,7 +911,7 @@ class DemoActivity : ComponentActivity() {
         val keep = BooleanArray(n * n / 4 + 2)   // per region label: big enough to draw
         var next = 0
         for (start in 0 until n * n) {
-            if (mask[start] <= 0.5f || labels[start] != 0) continue
+            if (mask[start] <= MASK_THRESHOLD || labels[start] != 0) continue
             next++
             if (next >= keep.size) break
             var head = 0
@@ -922,10 +922,10 @@ class DemoActivity : ComponentActivity() {
                 val i = queue[head++]
                 val u = i % n
                 val v = i / n
-                if (u > 0 && labels[i - 1] == 0 && mask[i - 1] > 0.5f) { labels[i - 1] = next; queue[tail++] = i - 1 }
-                if (u < n - 1 && labels[i + 1] == 0 && mask[i + 1] > 0.5f) { labels[i + 1] = next; queue[tail++] = i + 1 }
-                if (v > 0 && labels[i - n] == 0 && mask[i - n] > 0.5f) { labels[i - n] = next; queue[tail++] = i - n }
-                if (v < n - 1 && labels[i + n] == 0 && mask[i + n] > 0.5f) { labels[i + n] = next; queue[tail++] = i + n }
+                if (u > 0 && labels[i - 1] == 0 && mask[i - 1] > MASK_THRESHOLD) { labels[i - 1] = next; queue[tail++] = i - 1 }
+                if (u < n - 1 && labels[i + 1] == 0 && mask[i + 1] > MASK_THRESHOLD) { labels[i + 1] = next; queue[tail++] = i + 1 }
+                if (v > 0 && labels[i - n] == 0 && mask[i - n] > MASK_THRESHOLD) { labels[i - n] = next; queue[tail++] = i - n }
+                if (v < n - 1 && labels[i + n] == 0 && mask[i + n] > MASK_THRESHOLD) { labels[i + n] = next; queue[tail++] = i + n }
             }
             keep[next] = tail >= MIN_REGION * n * n
         }
@@ -992,9 +992,12 @@ class DemoActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "HandDemo"
-        private const val MODEL_ASSET = "handseg.pte"
-        private const val SMALL_MODEL_ASSET = "handseg_small.pte"
+        private const val MODEL_ASSET = "skinseg.pte"            // skin: faces, hands, arms (segkit-label-skin)
+        private const val SMALL_MODEL_ASSET = "skinseg_small.pte"
         private const val SMALL_SIZE = 256
+        // Skin probability needed to draw a pixel: 0.8 keeps the gaps between fingers open and drops faint desk/cable
+        // blobs (desk recording: finger gaps filled 24% -> 12%, false skin 1.1% -> 0.8% of the frame).
+        private const val MASK_THRESHOLD = 0.8f
         private const val MIN_REGION = 0.003   // of the crop: smaller skin specks are not drawn
         private const val TARGET_FPS = 30
         private const val SIZE = 384

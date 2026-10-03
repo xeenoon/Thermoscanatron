@@ -37,7 +37,7 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dataset", type=Path)
     ap.add_argument("--stems-from", nargs="+", required=True, help="video stems (frames <video>_fNNNNNN)")
-    ap.add_argument("--model", action="append", required=True, help="path:encoder:size[:prev]")
+    ap.add_argument("--model", action="append", required=True, help="path:encoder:size[:prev][:half]")
     ap.add_argument("--out", type=Path, default=Path("runs/phone_eval"))
     ap.add_argument("--all-frames", action="store_true",
                     help="score every frame, not only validation blocks (only fair for models that never trained on them)")
@@ -65,8 +65,8 @@ def main() -> None:
     for spec in args.model:
         parts = spec.split(":")
         path, enc, size = parts[0], parts[1], int(parts[2])
-        prev = len(parts) > 3 and parts[3] == "prev"
-        net = HandSegNet(enc, in_chans=4 if prev else 3).to(device).eval()
+        prev = "prev" in parts[3:]
+        net = HandSegNet(enc, in_chans=4 if prev else 3, half_res="half" in parts[3:]).to(device).eval()
         state = torch.load(path, map_location=device)
         net.load_state_dict({k: v for k, v in state.items() if not k.startswith("aux.")}, strict=False)
         for mode in (["empty", "chained"] if prev else ["-"]):

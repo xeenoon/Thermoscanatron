@@ -4,6 +4,8 @@
 
 Options:
   in_chans=4    a 4th input channel carries the previous frame's mask (0/1), for the phone's per-frame model;
+  half_res      one more decoder stage on the encoder's 1/2-resolution features, so the mask comes out at 1/2
+                instead of 1/4 of the input: gaps between fingers are a few pixels wide and merge at 1/4;
   aux_classes   an extra 1x1 head on the decoder predicting background / skin / hair / clothing. Only used as a
                 training signal (it teaches the features what skin is *not*); in eval mode forward() still
                 returns just (mask, present), so export and the phone are unchanged.
@@ -37,26 +39,36 @@ class UpBlock(nn.Module):
 
 class HandSegNet(nn.Module):
     def __init__(self, encoder: str = "mobilenetv3_small_100", pretrained: bool = False,
-                 decoder_channels: tuple[int, ...] = (96, 64, 32), in_chans: int = 3, aux_classes: int = 0):
+                 decoder_channels: tuple[int, ...] = (96, 64, 32), in_chans: int = 3, aux_classes: int = 0,
+                 half_res: bool = False):
         super().__init__()
-        # Feature maps at 1/4, 1/8, 1/16, 1/32.
+        # Feature maps at (1/2,) 1/4, 1/8, 1/16, 1/32.
+        self.half_res = half_res
         self.encoder = timm.create_model(encoder, pretrained=pretrained, features_only=True,
-                                         out_indices=(1, 2, 3, 4), in_chans=in_chans)
-        c4, c8, c16, c32 = self.encoder.feature_info.channels()
+                                         out_indices=(0, 1, 2, 3, 4) if half_res else (1, 2, 3, 4), in_chans=in_chans)
+        chans = self.encoder.feature_info.channels()
+        c4, c8, c16, c32 = chans[-4:]
         d16, d8, d4 = decoder_channels
         self.up16 = UpBlock(c32, c16, d16)
         self.up8 = UpBlock(d16, c8, d8)
         self.up4 = UpBlock(d8, c4, d4)
-        self.head = nn.Conv2d(d4, 1, 1)
-        self.aux = nn.Conv2d(d4, aux_classes, 1) if aux_classes else None
+        d_out = d4
+        if half_res:
+            d_out = max(16, d4 // 2)
+            self.up2 = UpBlock(d4, chans[0], d_out)
+        self.head = nn.Conv2d(d_out, 1, 1)
+        self.aux = nn.Conv2d(d_out, aux_classes, 1) if aux_classes else None
         # "Is there a hand in this crop at all?" from the deepest features.
         self.presence = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(c32, 1))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        f4, f8, f16, f32 = self.encoder(x)
+        feats = self.encoder(x)
+        f4, f8, f16, f32 = feats[-4:]
         y = self.up16(f32, f16)
         y = self.up8(y, f8)
         y = self.up4(y, f4)
+        if self.half_res:
+            y = self.up2(y, feats[0])
         mask = F.interpolate(self.head(y), size=x.shape[-2:], mode="bilinear", align_corners=False)
         if self.aux is not None and self.training:
             aux = F.interpolate(self.aux(y), size=x.shape[-2:], mode="bilinear", align_corners=False)

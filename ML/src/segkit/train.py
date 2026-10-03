@@ -137,6 +137,9 @@ def main() -> None:
                    help="dataset has hands/ and parse/ maps (segkit-label-skin): hand-weighted loss, hand metrics")
     p.add_argument("--hand-weight", type=float, default=3.0, help="mask-loss weight on and around hands (--extras)")
     p.add_argument("--aux", action="store_true", help="aux background/skin/hair/clothing head (needs --extras)")
+    p.add_argument("--half-res", action="store_true", help="extra decoder stage: mask at 1/2 instead of 1/4 resolution")
+    p.add_argument("--teacher", help="distil from a trained model: path:encoder[:size] (e.g. the big model's best.pt)")
+    p.add_argument("--distill-weight", type=float, default=1.0)
     p.add_argument("--prev-mask", action="store_true",
                    help="4th input channel = previous frame's mask (the phone's per-frame model)")
     p.add_argument("--frame-crops", type=float, default=0.0,
@@ -192,7 +195,18 @@ def main() -> None:
     val_loader = DataLoader(val_set, batch_size=args.batch, num_workers=args.workers, pin_memory=True)
 
     model = HandSegNet(args.encoder, pretrained=not args.no_pretrained and args.init is None,
-                       in_chans=4 if args.prev_mask else 3, aux_classes=AUX_CLASSES if args.aux else 0).to(device)
+                       in_chans=4 if args.prev_mask else 3, aux_classes=AUX_CLASSES if args.aux else 0,
+                       half_res=args.half_res).to(device)
+    teacher = None
+    if args.teacher:
+        # The teacher's per-pixel skin probabilities are a softer, more consistent target than the auto-labels: they
+        # say how sure a stronger model is at every finger edge, and they are 0 on desks and cables it has learned
+        # to ignore. Loss = labels as before + distill_weight x BCE(student, teacher probability).
+        tp, tenc, *tsz = args.teacher.split(":")
+        teacher = HandSegNet(tenc).to(device).eval()
+        teacher.load_state_dict({k: v for k, v in torch.load(tp, map_location=device).items()
+                                 if not k.startswith("aux.")}, strict=False)
+        teacher_size = int(tsz[0]) if tsz else 384
     if args.init:
         load_init(model, torch.load(args.init, map_location=device))
     print(f"HandSegNet {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params")
@@ -216,6 +230,13 @@ def main() -> None:
                 with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
                     out = model(x)
                 loss = loss_fn(out[0], out[1], m, present, out[2] if len(out) > 2 else None)
+                if teacher is not None:
+                    with torch.no_grad(), torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
+                        xt = F.interpolate(x[:, :3], size=(teacher_size, teacher_size), mode="bilinear",
+                                           align_corners=False)
+                        soft = torch.sigmoid(teacher(xt)[0].float())
+                        soft = F.interpolate(soft, size=x.shape[-2:], mode="bilinear", align_corners=False)
+                    loss = loss + args.distill_weight * F.binary_cross_entropy_with_logits(out[0].float(), soft)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
