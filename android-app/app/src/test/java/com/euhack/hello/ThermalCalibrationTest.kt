@@ -148,6 +148,25 @@ class ThermalCalibrationTest {
         }
     }
 
+    /**
+     * Capture 20261003_160305 (hand at 23-29 cm only) once fitted 6.5 cm right, 8.5 cm down, 4.7 cm behind the
+     * lens with a compensating 27 deg tilt: right at 25 cm, ~25 deg up-left at 1.5 m. With the taped-rig limits
+     * and the zero-offset start it must stay near the phone axis, and fit at least as well.
+     */
+    @Test fun singleDepthCaptureDoesNotTradeTiltForOffset() {
+        val f = File("../../ML/data/calibrations/capture_20261003_160305.bin")
+        assumeTrue("capture not present", f.isFile)
+        val (cams, thermals, intr) = ThermalCalibration.readCapture(f)
+        val r = ThermalCalibration.solve(cams, thermals, intr, rig = ThermalCalibration.Rig.TAPED)!!
+        val p = r.pose.toArray()
+        println(CalibrationStore.describe(r))
+        assertTrue(r.pose.mirror)
+        assertTrue("yaw ${Math.toDegrees(p[0])}", abs(Math.toDegrees(p[0])) < 10)
+        assertTrue("pitch ${Math.toDegrees(p[1])}", abs(Math.toDegrees(p[1])) < 10)
+        assertTrue("offset ${p.slice(3..5)}", sqrt(p[3] * p[3] + p[4] * p[4] + p[5] * p[5]) < 6)
+        assertTrue("correlation ${r.correlation}", r.correlation > 0.61)
+    }
+
     private fun usable(dtNs: Long) = (dtNs / 1e9).let { it in 0.0..55.0 || it in 60.0..70.0 }
 
     private fun loadSession(dir: File): Triple<List<ThermalCalibration.CameraSample>, List<ThermalCalibration.ThermalSample>, CameraIntrinsics> {

@@ -70,8 +70,9 @@ import kotlin.math.sqrt
  *  - Dump NO-HAND frames: [NoHandLogger] diagnostics;
  *  - Stream thermal input: shows only the USB thermal camera ([ThermalUsbStream]) full screen. The camera
  *    keeps running behind it so recording still captures both;
- *  - Calibrate thermal ↔ camera: 5 s of the hand seen by both cameras -> [ThermalCalibration] finds where
- *    the thermal camera sits (angles, offsets), shown in a popup and saved ([CalibrationStore]);
+ *  - Calibrate thermal ↔ camera: the hand near, far, then top-left and bottom-left at medium distance, seen
+ *    by both cameras -> [ThermalCalibration] finds where the thermal camera sits (angles, offsets), shown
+ *    in a popup and saved ([CalibrationStore]);
  *  - Fused thermal view (once calibrated): only the part of the camera image the thermal camera also sees,
  *    with temperatures upsampled along the camera's edges ([FusionRenderer]); the rest is black.
  * Whenever the thermal camera is plugged in (and not fused), a small live thermal view sits in the corner.
@@ -127,8 +128,17 @@ class DemoActivity : ComponentActivity() {
     private val calibCams = ArrayList<ThermalCalibration.CameraSample>()      // analysis thread only
     private val calibThermals = ConcurrentLinkedQueue<ThermalCalibration.ThermalSample>()
     @Volatile private var collectThermal = false
-    private var calibHandMs = 0L
-    @Volatile private var calibNeedsDepth = false
+    /** Guided capture: near and far give the parallax that separates tilt from offset, the corners the roll. */
+    private enum class CalibPhase(val prompt: String) {
+        NEAR("Hold your open hand close to the sensor (~15–20 cm)"),
+        FAR("Now hold it far away from the sensor (arm's length)"),
+        TOP_LEFT("Medium distance (~30 cm): move your hand to the top-left of the box"),
+        BOTTOM_LEFT("Medium distance (~30 cm): move your hand to the bottom-left of the box"),
+    }
+    @Volatile private var calibPhase = CalibPhase.NEAR
+    @Volatile private var calibHint = ""
+    private var calibPhaseMs = 0L
+    private var calibStartMs = 0L
     private var calibLastHandMs = 0L
     private var lastThermalMs = 0L
 
@@ -356,9 +366,11 @@ class DemoActivity : ComponentActivity() {
         setThermalMode(false)
         analysisExecutor.execute {
             calibCams.clear()
-            calibHandMs = 0L
+            calibPhase = CalibPhase.NEAR
+            calibHint = ""
+            calibPhaseMs = 0L
+            calibStartMs = 0L
             calibLastHandMs = 0L
-            calibNeedsDepth = false
         }
         calibThermals.clear()
         collectThermal = true
@@ -367,34 +379,75 @@ class DemoActivity : ComponentActivity() {
         calibProgress.progress = 0
         calibProgress.visibility = View.VISIBLE
         status.setTextColor(Color.WHITE)
-        status.text = CALIBRATE_PROMPT
+        status.text = calibPrompt()
     }
 
-    /** Analysis thread: keep frames where both cameras see the hand; 5 s of them completes the capture. */
+    private fun calibPrompt() = "Calibrating, step ${calibPhase.ordinal + 1}/${CalibPhase.values().size}\n${calibPhase.prompt}"
+
+    /** Empty if [s] is where [calibPhase] wants the hand, else what to change. */
+    private fun phaseHint(s: ThermalCalibration.CameraSample, cam: CameraIntrinsics): String {
+        val z = s.depth
+        val rx = (s.point[0] / z * cam.f + cam.cx - s.left) / s.side - 0.5
+        val ry = (s.point[1] / z * cam.f + cam.cy - s.top) / s.side - 0.5
+        fun depth(min: Double, max: Double) = when {
+            z < min -> "further away"
+            z > max -> "closer"
+            else -> ""
+        }
+        fun corner(wantTop: Boolean): String {
+            val d = depth(CALIB_MID_MIN_CM, CALIB_MID_MAX_CM)
+            if (d.isNotEmpty()) return d
+            val moves = listOfNotNull(
+                if (rx > -CALIB_CORNER) "left" else null,
+                if (wantTop && ry > -CALIB_CORNER) "up" else null,
+                if (!wantTop && ry < CALIB_CORNER) "down" else null)
+            return moves.joinToString(" and ")
+        }
+        return when (calibPhase) {
+            CalibPhase.NEAR -> depth(0.0, CALIB_NEAR_CM)
+            CalibPhase.FAR -> depth(CALIB_FAR_CM, Double.POSITIVE_INFINITY)
+            CalibPhase.TOP_LEFT -> corner(true)
+            CalibPhase.BOTTOM_LEFT -> corner(false)
+        }
+    }
+
+    /**
+     * Analysis thread: keep every frame where both cameras see the hand; each [CalibPhase] completes after
+     * [CALIB_PHASE_MS] of the hand where that phase wants it.
+     */
     private fun collectCalibration(tsNs: Long, mask: FloatArray, left: Int, top: Int, side: Int,
                                    cam: CameraIntrinsics, handVisible: Boolean, nowMs: Long) {
+        if (calibStartMs == 0L) calibStartMs = nowMs
+        if (nowMs - calibStartMs > CALIB_TIMEOUT_MS) {
+            calibState = CalibState.SOLVING
+            collectThermal = false
+            finishCalibration(null, "Timed out at step ${calibPhase.ordinal + 1}: ${calibPhase.prompt.lowercase()}.")
+            return
+        }
         val sample = if (handVisible && thermalLive())
             ThermalCalibration.cameraSample(tsNs, mask, SIZE, left, top, side, cam) else null
         if (sample == null) {
             calibLastHandMs = 0L
+            calibHint = ""
             return
         }
         calibCams.add(sample)
-        if (calibLastHandMs > 0) calibHandMs += minOf(nowMs - calibLastHandMs, 200L)
+        val hint = phaseHint(sample, cam)
+        calibHint = hint
+        if (hint.isEmpty() && calibLastHandMs > 0) calibPhaseMs += minOf(nowMs - calibLastHandMs, 200L)
         calibLastHandMs = nowMs
-        // Parallax separates tilt from offset, so the capture also needs the hand near and far: after 5 s it
-        // keeps going until the depth spread is there (or 15 s have passed).
-        val spread = ThermalCalibration.depthSpread(calibCams)
-        val needDepth = calibHandMs >= CALIBRATION_MS && spread < ThermalCalibration.MIN_DEPTH_SPREAD
-        calibNeedsDepth = needDepth
-        val progress = if (!needDepth) (calibHandMs * 1000 / CALIBRATION_MS).toInt().coerceAtMost(1000)
-            else (900 + 100 * (spread - 1) / (ThermalCalibration.MIN_DEPTH_SPREAD - 1)).toInt().coerceAtMost(999)
-        runOnUiThread { calibProgress.progress = progress }
-        if (calibHandMs >= CALIBRATION_MS && (!needDepth || calibHandMs >= MAX_CALIBRATION_MS)) {
-            calibState = CalibState.SOLVING
-            val cams = ArrayList(calibCams)
-            Thread({ solveCalibration(cams) }, "calibration").start()
+        if (calibPhaseMs >= CALIB_PHASE_MS) {
+            calibPhaseMs = 0L
+            val next = calibPhase.ordinal + 1
+            if (next < CalibPhase.values().size) calibPhase = CalibPhase.values()[next] else {
+                calibState = CalibState.SOLVING
+                val cams = ArrayList(calibCams)
+                Thread({ solveCalibration(cams) }, "calibration").start()
+                return
+            }
         }
+        val progress = ((calibPhase.ordinal + calibPhaseMs.toDouble() / CALIB_PHASE_MS) * 1000 / CalibPhase.values().size).toInt()
+        runOnUiThread { calibProgress.progress = progress }
     }
 
     private fun solveCalibration(cams: List<ThermalCalibration.CameraSample>) {
@@ -404,6 +457,10 @@ class DemoActivity : ComponentActivity() {
         collectThermal = false
         val thermals = calibThermals.toList()
         val camera = cams.firstOrNull()?.let { intrinsicsForCalibration } ?: return finishCalibration(null)
+        val spread = ThermalCalibration.depthSpread(cams)
+        if (spread < ThermalCalibration.MIN_DEPTH_SPREAD) return finishCalibration(null, String.format(Locale.US,
+            "The hand was only %.1fx further away at its far end than at its near end (needs %.1fx): " +
+                "go closer for step 1 and further for step 2.", spread, ThermalCalibration.MIN_DEPTH_SPREAD))
         try {
             val dir = File(getExternalFilesDir(null), "calibrations").apply { mkdirs() }
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -412,7 +469,7 @@ class DemoActivity : ComponentActivity() {
             Log.w(TAG, "could not save the calibration capture", e)
         }
         val result = try {
-            ThermalCalibration.solve(cams, thermals, camera) { p ->
+            ThermalCalibration.solve(cams, thermals, camera, rig = ThermalCalibration.Rig.TAPED) { p ->
                 runOnUiThread { calibProgress.progress = (p * 1000).toInt() }
             }
         } catch (e: Exception) {
@@ -424,21 +481,21 @@ class DemoActivity : ComponentActivity() {
 
     @Volatile private var intrinsicsForCalibration: CameraIntrinsics? = null
 
-    private fun finishCalibration(result: ThermalCalibration.Result?) = runOnUiThread {
+    private fun finishCalibration(result: ThermalCalibration.Result?, failure: String? = null) = runOnUiThread {
         calibState = CalibState.OFF
         calibProgress.visibility = View.GONE
         val dialog = AlertDialog.Builder(this)
         if (result == null) {
             dialog.setTitle("Not enough data")
-                .setMessage("Both cameras need to see your hand for 5 seconds. Keep it inside the box, " +
-                    "in front of the thermal camera, and move it around slowly.")
+                .setMessage(failure ?: ("Both cameras need to see your hand at every step. Keep it inside the box, " +
+                    "in front of the thermal camera, and move it slowly."))
                 .setPositiveButton("Retry") { _, _ -> startCalibration() }
                 .setNegativeButton("Cancel", null)
         } else {
             val good = result.correlation >= 0.6
             dialog.setTitle(if (good) "Calibrated" else "Calibration looks poor")
                 .setMessage(CalibrationStore.describe(result) + if (good) "" else
-                    "\n\nTry again with your hand filling more of the box, moving nearer and further.")
+                    "\n\nTry again, holding your open hand flat towards the phone at each step.")
                 .setPositiveButton("Use it") { _, _ ->
                     calibStore.save(result)
                     calibration = result
@@ -822,9 +879,13 @@ class DemoActivity : ComponentActivity() {
             }
             if (thermalMode || state == CalibState.SOLVING) return@runOnUiThread
             if (state == CalibState.COLLECTING) {
-                status.text = (if (calibNeedsDepth) DEPTH_PROMPT else CALIBRATE_PROMPT) +
-                    if (handVisible) "" else "\n(no hand seen)"
-                status.setTextColor(if (handVisible) Color.GREEN else Color.WHITE)
+                val hint = calibHint
+                status.text = calibPrompt() + when {
+                    !handVisible -> "\n(no hand seen)"
+                    hint.isNotEmpty() -> "\n(move $hint)"
+                    else -> ""
+                }
+                status.setTextColor(if (handVisible && hint.isEmpty()) Color.GREEN else Color.WHITE)
                 return@runOnUiThread
             }
             val fused = if (showFused) "$fusedStatus   |   " else ""
@@ -838,22 +899,21 @@ class DemoActivity : ComponentActivity() {
     }
 
     /**
-     * Outline of the single largest blob in the small model's mask (prob > 0.5), as (u, v) pairs in SIZE-model
-     * pixels (the overlay's units). The model can mark stray skin-coloured patches as separate blobs; there is only
-     * one hand, so everything but the largest connected region is dropped. No per-pixel allocation: this runs on
-     * every frame.
+     * Outline of every skin region in the small model's mask (prob > 0.5), as (u, v) pairs in SIZE-model pixels
+     * (the overlay's units): a face, two hands and an arm are separate regions. Specks smaller than
+     * [MIN_REGION] of the crop are dropped. No per-pixel allocation: this runs on every frame.
      */
     private fun edgePoints(mask: FloatArray): FloatArray {
         val n = SMALL_SIZE
         val labels = edgeLabels
         val queue = edgeQueue
         labels.fill(0)
-        var best = 0
-        var bestArea = 0
+        val keep = BooleanArray(n * n / 4 + 2)   // per region label: big enough to draw
         var next = 0
         for (start in 0 until n * n) {
             if (mask[start] <= 0.5f || labels[start] != 0) continue
             next++
+            if (next >= keep.size) break
             var head = 0
             var tail = 0
             queue[tail++] = start
@@ -867,13 +927,10 @@ class DemoActivity : ComponentActivity() {
                 if (v > 0 && labels[i - n] == 0 && mask[i - n] > 0.5f) { labels[i - n] = next; queue[tail++] = i - n }
                 if (v < n - 1 && labels[i + n] == 0 && mask[i + n] > 0.5f) { labels[i + n] = next; queue[tail++] = i + n }
             }
-            if (tail > bestArea) {
-                bestArea = tail
-                best = next
-            }
+            keep[next] = tail >= MIN_REGION * n * n
         }
-        if (best == 0) return FloatArray(0)
-        fun inside(u: Int, v: Int) = u in 0 until n && v in 0 until n && labels[v * n + u] == best
+        if (next == 0) return FloatArray(0)
+        fun inside(u: Int, v: Int) = u in 0 until n && v in 0 until n && labels[v * n + u].let { it != 0 && keep[it] }
         var count = 0
         for (v in 0 until n) for (u in 0 until n) {
             if (inside(u, v) && (!inside(u - 1, v) || !inside(u + 1, v) || !inside(u, v - 1) || !inside(u, v + 1))) count++
@@ -938,6 +995,7 @@ class DemoActivity : ComponentActivity() {
         private const val MODEL_ASSET = "handseg.pte"
         private const val SMALL_MODEL_ASSET = "handseg_small.pte"
         private const val SMALL_SIZE = 256
+        private const val MIN_REGION = 0.003   // of the crop: smaller skin specks are not drawn
         private const val TARGET_FPS = 30
         private const val SIZE = 384
         private const val BOX_FRACTION = 0.9f
@@ -948,13 +1006,15 @@ class DemoActivity : ComponentActivity() {
         private const val MENU_THERMAL = 3
         private const val MENU_CALIBRATE = 4
         private const val MENU_FUSED = 5
-        private const val CALIBRATION_MS = 5000L
-        private const val MAX_CALIBRATION_MS = 15000L
-        private const val DEPTH_PROMPT = "Almost there: bring your hand close to the phone (~15 cm), then out to arm's length"
+        private const val CALIB_PHASE_MS = 3000L        // hand time in the right place per step
+        private const val CALIB_TIMEOUT_MS = 90_000L
+        private const val CALIB_NEAR_CM = 20.0
+        private const val CALIB_FAR_CM = 40.0
+        private const val CALIB_MID_MIN_CM = 22.0
+        private const val CALIB_MID_MAX_CM = 40.0
+        private const val CALIB_CORNER = 0.12           // hand centre this far (box fraction) off-centre
         private const val VETO_GRID = 24
         private const val VETO_DELTA_C = 2.5f
-        private const val CALIBRATE_PROMPT = "Hold your hand up inside the box to calibrate\n" +
-            "Move it around slowly, nearer and further"
         private const val INSET_W = 360
         private val MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         private val STD = floatArrayOf(0.229f, 0.224f, 0.225f)

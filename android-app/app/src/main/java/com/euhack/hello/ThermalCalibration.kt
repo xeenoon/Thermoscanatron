@@ -32,6 +32,9 @@ import kotlin.math.sqrt
  * A tilt and a sideways offset look alike when the hand stays at one depth, so both stages also carry a weak
  * preference for small offsets and a lens near its datasheet ([OFFSET_PRIOR_CM], [LENS_PRIOR]); hand depth
  * variation (parallax) outweighs it, which is why the capture asks for the hand near and far.
+ * For a sensor taped to the phone, [Rig.TAPED] tightens both: a hand at nearly one depth once let the fit trade
+ * 8 cm of offset for a 27 deg tilt that only lined up at 25 cm, so at 1.5 m the overlay sat ~25 deg up-left.
+ * Stage 2 therefore also starts from the best zero-offset rotation (both mirrorings) and keeps the best fit.
  */
 object ThermalCalibration {
     const val MASK_GRID = 96
@@ -40,6 +43,16 @@ object ThermalCalibration {
     const val BLUR_PX = 0.8
     private const val PIXELS = ThermalGeometry.W * ThermalGeometry.H
     const val MAX_OFFSET_CM = 40.0
+
+    /** How far the thermal camera may sit from the phone lens (cm) and how strongly small offsets are preferred. */
+    class Rig(val maxOffsetCm: Double, val maxDepthCm: Double, val offsetPriorCm: Double) {
+        companion object {
+            /** Any mounting: tens of cm away, in front of or behind the phone. */
+            val ANY = Rig(MAX_OFFSET_CM, MAX_OFFSET_CM, OFFSET_PRIOR_CM)
+            /** Sensor taped to the back of the phone: within a phone's length of the lens, in its plane. */
+            val TAPED = Rig(10.0, 3.0, 4.0)
+        }
+    }
     const val MAX_EDGE_FRACTION = 0.15
     /** The capture needs the hand this much further away at its far end than at its near end (p90 / p10). */
     const val MIN_DEPTH_SPREAD = 1.5
@@ -56,19 +69,19 @@ object ThermalCalibration {
     private val MAX_LOG_K = kotlin.math.ln(1.33)
 
     /**
-     * Physically possible rig (not a mounting assumption): both cameras face the same way (optical axes
-     * within 80 deg), the thermal camera is within [MAX_OFFSET_CM] of the lens and on the phone's side of the
-     * hand (5 cm short of [nearCm]), and its lens within +-33% of the datasheet.
+     * Physically possible rig: both cameras face the same way (optical axes within 80 deg), the thermal
+     * camera is within [Rig.maxOffsetCm] of the lens, within [Rig.maxDepthCm] of it along the axis and on the
+     * phone's side of the hand (5 cm short of [nearCm]), and its lens within +-33% of the datasheet.
      */
-    fun plausible(p: DoubleArray, nearCm: Double): Boolean {
+    fun plausible(p: DoubleArray, nearCm: Double, rig: Rig = Rig.ANY): Boolean {
         val r = ThermalGeometry.rotation(p[0], p[1], p[2])
-        return r[8] > MIN_AXIS_COS && sqrt(p[3] * p[3] + p[4] * p[4] + p[5] * p[5]) < MAX_OFFSET_CM &&
-            p[5] < nearCm - 5 && abs(p[6]) < MAX_LOG_K
+        return r[8] > MIN_AXIS_COS && sqrt(p[3] * p[3] + p[4] * p[4] + p[5] * p[5]) < rig.maxOffsetCm &&
+            abs(p[5]) < rig.maxDepthCm && p[5] < nearCm - 5 && abs(p[6]) < MAX_LOG_K
     }
 
-    /** Weak preference for small offsets and a datasheet lens, in correlation units (20 cm costs ~0.02). */
-    private fun prior(p: DoubleArray): Double =
-        PRIOR_WEIGHT * ((p[3] * p[3] + p[4] * p[4] + p[5] * p[5]) / (OFFSET_PRIOR_CM * OFFSET_PRIOR_CM) +
+    /** Preference for small offsets and a datasheet lens, in correlation units (Rig.ANY: 20 cm costs ~0.02). */
+    private fun prior(p: DoubleArray, rig: Rig): Double =
+        PRIOR_WEIGHT * ((p[3] * p[3] + p[4] * p[4] + p[5] * p[5]) / (rig.offsetPriorCm * rig.offsetPriorCm) +
             p[6] * p[6] / (LENS_PRIOR * LENS_PRIOR))
 
     /** Hand depth spread of the capture (90th / 10th percentile); parallax needs it well above 1. */
@@ -283,7 +296,7 @@ object ThermalCalibration {
     private const val HUBER = 1.5
 
     /** Robust cost and its Gauss-Newton pieces for the centroid reprojection; [x] = 6 pose params. */
-    private fun reprojection(x: DoubleArray, mirror: Boolean, pairs: List<Pair>, residual: DoubleArray) {
+    private fun reprojection(x: DoubleArray, mirror: Boolean, pairs: List<Pair>, residual: DoubleArray, priorCm: Double) {
         val pose = ThermalPose(x[0], x[1], x[2], x[3], x[4], x[5], 0.0, mirror)
         val uv = DoubleArray(2)
         for ((i, p) in pairs.withIndex()) {
@@ -291,8 +304,8 @@ object ThermalCalibration {
             residual[2 * i] = uv[0] - p.thPt[0]
             residual[2 * i + 1] = uv[1] - p.thPt[1]
         }
-        // Weak tie-breaker towards small offsets: 1 px per OFFSET_PRIOR_CM.
-        for (k in 0..2) residual[2 * pairs.size + k] = x[3 + k] / OFFSET_PRIOR_CM
+        // Tie-breaker towards small offsets: 1 px per [priorCm].
+        for (k in 0..2) residual[2 * pairs.size + k] = x[3 + k] / priorCm
     }
 
     private fun huberCost(r: DoubleArray): Double {
@@ -305,21 +318,22 @@ object ThermalCalibration {
     }
 
     /** Huber-weighted Levenberg-Marquardt with a forward-difference Jacobian. Returns (params, cost). */
-    private fun levenbergMarquardt(x0: DoubleArray, mirror: Boolean, pairs: List<Pair>, maxIter: Int): kotlin.Pair<DoubleArray, Double> {
+    private fun levenbergMarquardt(x0: DoubleArray, mirror: Boolean, pairs: List<Pair>, maxIter: Int,
+                                   priorCm: Double): kotlin.Pair<DoubleArray, Double> {
         val n = 6
         val m = pairs.size * 2 + 3
         var x = x0.copyOf()
         val r = DoubleArray(m)
         val rp = DoubleArray(m)
         val jac = Array(n) { DoubleArray(m) }
-        reprojection(x, mirror, pairs, r)
+        reprojection(x, mirror, pairs, r, priorCm)
         var cost = huberCost(r)
         var lambda = 1e-3
         repeat(maxIter) {
             for (k in 0 until n) {
                 val h = 1e-6 * max(1.0, abs(x[k]))
                 val xp = x.copyOf().also { it[k] += h }
-                reprojection(xp, mirror, pairs, rp)
+                reprojection(xp, mirror, pairs, rp, priorCm)
                 for (j in 0 until m) jac[k][j] = (rp[j] - r[j]) / h
             }
             val a = Array(n) { DoubleArray(n) }
@@ -338,7 +352,7 @@ object ThermalCalibration {
                 val aa = Array(n) { k -> DoubleArray(n) { l -> a[k][l] + if (k == l) lambda * max(a[k][k], 1e-9) else 0.0 } }
                 val step = solve(aa, DoubleArray(n) { -g[it] }) ?: break
                 val xn = DoubleArray(n) { x[it] + step[it] }
-                reprojection(xn, mirror, pairs, rp)
+                reprojection(xn, mirror, pairs, rp, priorCm)
                 val cn = huberCost(rp)
                 if (cn < cost) {
                     val rel = (cost - cn) / max(cost, 1e-12)
@@ -382,12 +396,12 @@ object ThermalCalibration {
 
     private fun medianReprojection(x: DoubleArray, mirror: Boolean, pairs: List<Pair>): Double {
         val r = DoubleArray(pairs.size * 2 + 3)
-        reprojection(x, mirror, pairs, r)
+        reprojection(x, mirror, pairs, r, OFFSET_PRIOR_CM)
         return DoubleArray(pairs.size) { kotlin.math.hypot(r[2 * it], r[2 * it + 1]) }.sorted()[pairs.size / 2]
     }
 
     /** Multi-start over all rolls x yaw/pitch +-60 deg x mirror. Returns (params[7], mirror, median px). */
-    fun poseFromPoints(pairs: List<Pair>): Triple<DoubleArray, Boolean, Double> {
+    fun poseFromPoints(pairs: List<Pair>, rig: Rig = Rig.ANY): Triple<DoubleArray, Boolean, Double> {
         val near = nearDepth(pairs)
         var best = Double.POSITIVE_INFINITY
         var bestX = DoubleArray(6)
@@ -396,13 +410,29 @@ object ThermalCalibration {
             for (yawDeg in -60..60 step 30) for (pitchDeg in -60..60 step 30) {
                 val x0 = doubleArrayOf(Math.toRadians(yawDeg.toDouble()), Math.toRadians(pitchDeg.toDouble()),
                     Math.toRadians(rollDeg.toDouble()), 0.0, 0.0, 0.0)
-                val (x, cost) = levenbergMarquardt(x0, mirror, pairs, 60)
-                if (cost < best && plausible(x + 0.0, near)) {
+                val (x, cost) = levenbergMarquardt(x0, mirror, pairs, 60, rig.offsetPriorCm)
+                if (cost < best && plausible(x + 0.0, near, rig)) {
                     best = cost; bestX = x; bestMirror = mirror
                 }
             }
         bestX[2] = wrapAngle(bestX[2])
         return Triple(bestX + 0.0, bestMirror, medianReprojection(bestX, bestMirror, pairs))
+    }
+
+    /**
+     * Zero-offset rotations that best explain the silhouettes, from a grid over both mirrorings x all rolls x
+     * yaw/pitch +-10 deg: starts that do not depend on the point fit, which a capture with the hand at one
+     * depth can send to a tilt traded for an offset, or the wrong mirroring.
+     */
+    fun rotationStarts(pairs: List<Pair>, cam: CameraIntrinsics, count: Int): List<kotlin.Pair<DoubleArray, Boolean>> {
+        val grid = ArrayList<Triple<DoubleArray, Boolean, Double>>()
+        for (mirror in listOf(false, true)) for (rollDeg in 0 until 360 step 15)
+            for (yawDeg in -10..10 step 10) for (pitchDeg in -10..10 step 10) {
+                val p = doubleArrayOf(Math.toRadians(yawDeg.toDouble()), Math.toRadians(pitchDeg.toDouble()),
+                    Math.toRadians(rollDeg.toDouble()), 0.0, 0.0, 0.0, 0.0)
+                grid.add(Triple(p, mirror, correlation(p, mirror, pairs, cam, 1)))
+            }
+        return grid.sortedByDescending { it.third }.take(count).map { it.first to it.second }
     }
 
     /** Same rotation, reported with |pitch| <= 90 deg: (yaw, pitch, roll) == (yaw+180, 180-pitch, roll+180). */
@@ -605,31 +635,37 @@ object ThermalCalibration {
      * few frames with the hand seen by both cameras.
      */
     fun solve(cams: List<CameraSample>, thermals: List<ThermalSample>, cam: CameraIntrinsics,
-              maxIter: Int = 800, progress: (Double) -> Unit = {}): Result? {
+              maxIter: Int = 800, rig: Rig = Rig.ANY, progress: (Double) -> Unit = {}): Result? {
         // Stage 0: latency from geometry-free signals (see the class comment for why not from the fit).
         val measured = estimateLatency(cams, thermals)
         val latency = measured?.first ?: DEFAULT_LATENCY_MS
         val pairs = makePairs(cams, thermals, latency)
         if (pairs.size < MIN_PAIRS) return null
         // Stage 1: pose from points, multi-start.
-        val (x1, mirror, stage1Err) = poseFromPoints(pairs.every(120))
-        progress(0.4)
+        val pointSet = pairs.every(120)
+        val (x1, mirror1, stage1Err) = poseFromPoints(pointSet, rig)
         val fitSet = pairs.every(200)
+        val starts = listOf(doubleArrayOf(x1[0], x1[1], wrapAngle(x1[2]), x1[3], x1[4], x1[5], 0.0) to mirror1) +
+            rotationStarts(fitSet, cam, 2)
+        progress(0.4)
         val near = nearDepth(pairs)
-        val p1 = doubleArrayOf(x1[0], x1[1], wrapAngle(x1[2]), x1[3], x1[4], x1[5], 0.0)
 
-        // Stage 2: maximise silhouette correlation. Coarse search with one ray per thermal pixel (4x cheaper),
-        // then a short polish with the full 2x2 footprint. Stopping at 1e-3 (0.06 deg, 0.001 cm, 0.1% scale)
-        // is still far finer than the data resolves (~0.5 deg).
+        // Stage 2: maximise silhouette correlation. Coarse search with one ray per thermal pixel (4x cheaper)
+        // from every start, then a short polish of the best with the full 2x2 footprint. Stopping at 1e-3
+        // (0.06 deg, 0.001 cm, 0.1% scale) is still far finer than the data resolves (~0.5 deg).
         var evals = 0
         val step = doubleArrayOf(Math.toRadians(3.0), Math.toRadians(3.0), Math.toRadians(3.0), 2.0, 2.0, 2.0, 0.1)
-        fun objective(sub: Int) = { q: DoubleArray ->
+        fun objective(sub: Int, mirror: Boolean) = { q: DoubleArray ->
             evals++
-            if (evals % 25 == 0) progress(min(0.95, 0.4 + 0.55 * evals / (maxIter * 0.8)))
-            if (plausible(q, near)) -correlation(q, mirror, fitSet, cam, sub) + prior(q) else 1.0
+            if (evals % 25 == 0) progress(min(0.95, 0.4 + 0.55 * evals / (maxIter * 1.3)))
+            if (plausible(q, near, rig)) -correlation(q, mirror, fitSet, cam, sub) + prior(q, rig) else 1.0
         }
-        val coarse = nelderMead(objective(1), p1, step, maxIter, xatol = 1e-3, fatol = 1e-4)
-        val p = nelderMead(objective(4), coarse, DoubleArray(7) { step[it] / 3 }, maxIter / 4, xatol = 1e-3, fatol = 1e-4)
+        val (coarse, mirror) = starts.map { (x0, m) ->
+            val f = objective(1, m)
+            val x = nelderMead(f, x0, step, maxIter / 2, xatol = 1e-3, fatol = 1e-4)
+            Triple(x, m, f(x))
+        }.minByOrNull { it.third }!!.let { it.first to it.second }
+        val p = nelderMead(objective(4, mirror), coarse, DoubleArray(7) { step[it] / 3 }, maxIter / 4, xatol = 1e-3, fatol = 1e-4)
         val sigma = sensitivity(p, mirror, fitSet, cam)
         progress(1.0)
         canonicalize(p)
