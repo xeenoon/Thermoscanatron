@@ -17,20 +17,44 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
-from segkit.datasets.hands import (IMAGENET_MEAN, IMAGENET_STD, HandCrops, NegativeImages, load_split, read_list,
+from segkit.datasets.hands import (AUX_CLASSES, IMAGENET_MEAN, IMAGENET_STD, HandCrops, NegativeImages, load_split, read_list,
                                    session_of)
 from segkit.eval.metrics import score
 from segkit.losses import bce_dice
-from segkit.models.handseg import HandSegNet, ProbabilityHead
+from segkit.models.handseg import HandSegNet, ProbabilityHead, load_init
 
 N_VIS = 8
 PRESENCE_LOSS_WEIGHT = 0.5
 
 
-def loss_fn(mask_logits: torch.Tensor, present_logit: torch.Tensor, mask: torch.Tensor,
-            present: torch.Tensor) -> torch.Tensor:
-    return (bce_dice(mask_logits.float(), mask)
-            + PRESENCE_LOSS_WEIGHT * F.binary_cross_entropy_with_logits(present_logit.float(), present))
+AUX_LOSS_WEIGHT = 0.3
+HAND_ZONE_PX = 9          # hand pixels and this far around the hand outline get --hand-weight in the mask loss
+HAND_WEIGHT = 1.0         # set from --hand-weight
+
+
+def loss_fn(mask_logits: torch.Tensor, present_logit: torch.Tensor, target: torch.Tensor,
+            present: torch.Tensor, aux_logits: torch.Tensor | None = None) -> torch.Tensor:
+    """target [B, 1 or 3, H, W]: skin mask, and (with --extras data) hand mask and parse class.
+
+    Mask loss = BCE + dice; with a hand channel the BCE is weighted HAND_WEIGHT on and around the hand, so a missed
+    thumb or finger edge costs several times a missed patch of face. Aux head: cross-entropy on the parse classes."""
+    mask = target[:, :1]
+    logits = mask_logits.float()
+    if target.shape[1] > 1 and HAND_WEIGHT != 1.0:
+        k = 2 * HAND_ZONE_PX + 1
+        zone = F.max_pool2d(target[:, 1:2], k, stride=1, padding=HAND_ZONE_PX)
+        w = 1 + (HAND_WEIGHT - 1) * zone
+        bce = (F.binary_cross_entropy_with_logits(logits, mask, reduction="none") * w).sum() / w.sum()
+        p = torch.sigmoid(logits)
+        inter = (p * mask).sum(dim=(1, 2, 3))
+        dice = 1 - (2 * inter + 1) / (p.sum(dim=(1, 2, 3)) + mask.sum(dim=(1, 2, 3)) + 1)
+        seg = bce + dice.mean()
+    else:
+        seg = bce_dice(logits, mask)
+    loss = seg + PRESENCE_LOSS_WEIGHT * F.binary_cross_entropy_with_logits(present_logit.float(), present)
+    if aux_logits is not None and target.shape[1] > 2:
+        loss = loss + AUX_LOSS_WEIGHT * F.cross_entropy(aux_logits.float(), target[:, 2].long())
+    return loss
 
 
 @torch.no_grad()
@@ -39,6 +63,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: str) -> tuple[d
     model.eval()
     ious, p95s, f2s, losses, vis = [], [], [], [], []
     present_ok, neg_false_pos = [], []
+    hand_ious, hand_recalls = [], []
     for x, m, present in loader:
         x, m, present = (t.to(device, non_blocking=True) for t in (x, m, present))
         with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
@@ -48,6 +73,15 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: str) -> tuple[d
         pred_present = (present_logit.float() > 0).cpu().numpy()[:, 0]
         gt = m.cpu().numpy()[:, 0] > 0.5
         gt_present = present.cpu().numpy()[:, 0] > 0.5
+        if m.shape[1] > 1:
+            # Hands alone: inside a zone around each labelled hand, how well does the prediction match the hand?
+            hand = m[:, 1:2].float()
+            zone = (F.max_pool2d(hand, 2 * HAND_ZONE_PX + 1, stride=1, padding=HAND_ZONE_PX) > 0).cpu().numpy()[:, 0]
+            for p, h, z in zip(pred, hand.cpu().numpy()[:, 0] > 0.5, zone):
+                if h.sum() > 400:
+                    pz = p & z
+                    hand_ious.append((pz & h).sum() / (pz | h).sum())
+                    hand_recalls.append((pz & h).sum() / h.sum())
         present_ok += list(pred_present == gt_present)
         for p, g, gp, pp in zip(pred, gt, gt_present, pred_present):
             if gp:
@@ -63,13 +97,15 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: str) -> tuple[d
     return {"val_loss": float(np.mean(losses)), "iou": float(np.mean(ious)),
             "f@2px": float(np.mean(f2s)), "p95_px": float(np.median(p95s)),
             "present_acc": float(np.mean(present_ok)),
+            "hand_iou": float(np.mean(hand_ious)) if hand_ious else float("nan"),
+            "hand_recall": float(np.mean(hand_recalls)) if hand_recalls else float("nan"),
             "neg_fp_rate": float(np.mean(neg_false_pos)) if neg_false_pos else float("nan")}, vis
 
 
 def save_vis(vis: list, path: Path) -> None:
     tiles = []
     for x, gt, pred, _ in vis:
-        rgb = ((x.transpose(1, 2, 0) * IMAGENET_STD + IMAGENET_MEAN) * 255).clip(0, 255).astype(np.uint8)
+        rgb = ((x[:3].transpose(1, 2, 0) * IMAGENET_STD + IMAGENET_MEAN) * 255).clip(0, 255).astype(np.uint8)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         for mask, colour in ((gt, (0, 255, 0)), (pred, (0, 0, 255))):
             contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -96,11 +132,23 @@ def main() -> None:
     p.add_argument("--init", type=Path, help="start from these weights (fine-tune), e.g. the 384 px model's best.pt "
                                              "for the phone's small fast-path model at --size 192")
     p.add_argument("--name", default="handseg", help="exported file name (<name>.pte)")
+    p.add_argument("--encoder", default="mobilenetv3_small_100", help="timm encoder for HandSegNet")
+    p.add_argument("--extras", action="store_true",
+                   help="dataset has hands/ and parse/ maps (segkit-label-skin): hand-weighted loss, hand metrics")
+    p.add_argument("--hand-weight", type=float, default=3.0, help="mask-loss weight on and around hands (--extras)")
+    p.add_argument("--aux", action="store_true", help="aux background/skin/hair/clothing head (needs --extras)")
+    p.add_argument("--prev-mask", action="store_true",
+                   help="4th input channel = previous frame's mask (the phone's per-frame model)")
+    p.add_argument("--frame-crops", type=float, default=0.0,
+                   help="share of training crops taken like the phone's view (random square of the whole frame); "
+                        "when set, validation also uses the phone's centred crop")
     p.add_argument("--skin-tone-aug", type=float, default=0.0,
                    help="share of training crops whose labelled skin is recoloured to a random tone (segkit.skin_tone)")
     p.add_argument("--no-export", action="store_true")
     args = p.parse_args()
 
+    global HAND_WEIGHT
+    HAND_WEIGHT = args.hand_weight if args.extras else 1.0
     device = "cuda" if torch.cuda.is_available() else "cpu"
     args.out.mkdir(parents=True, exist_ok=True)
     train_stems, val_stems = load_split(args.dataset)
@@ -118,13 +166,15 @@ def main() -> None:
     negatives = read_list(args.negatives)
     weights = [1.0 / counts[k] for k in sessions]
     train_set = HandCrops(args.dataset, train_stems, args.size, train=True, negatives=negatives,
-                          skin_tone_p=args.skin_tone_aug)
+                          skin_tone_p=args.skin_tone_aug, frame_crop_p=args.frame_crops, extras=args.extras,
+                          prev_mask=args.prev_mask)
     if negatives:
         # Hand frames keep their total weight; negatives get negative_share of the draws, spread evenly.
         own = sum(weights)
         neg_w = own * args.negative_share / (1 - args.negative_share) / len(negatives)
         weights += [neg_w] * len(negatives)
-        train_set = ConcatDataset([train_set, NegativeImages(negatives, args.size, train=True)])
+        train_set = ConcatDataset([train_set, NegativeImages(negatives, args.size, train=True, extras=args.extras,
+                                                             prev_mask=args.prev_mask)])
         print(f"negatives: {len(negatives)} images, {args.negative_share:.0%} of draws, also used as paste backgrounds")
     sampler = WeightedRandomSampler(weights, num_samples=len(train_stems), replacement=True)
     train_loader = DataLoader(train_set, batch_size=args.batch,
@@ -132,17 +182,19 @@ def main() -> None:
                               persistent_workers=args.workers > 0)
     # Validation: one centred crop per frame, plus a fixed background crop from every 2nd hand frame so the
     # "no hand" false-positive rate is measured on real cluttered backgrounds.
-    val_parts = [HandCrops(args.dataset, val_stems, args.size, train=False),
-                 HandCrops(args.dataset, val_stems[::2], args.size, train=False, background_only=True)]
+    vkw = dict(extras=args.extras, prev_mask=args.prev_mask)
+    val_parts = [HandCrops(args.dataset, val_stems, args.size, train=False, phone_view=args.frame_crops > 0, **vkw),
+                 HandCrops(args.dataset, val_stems[::2], args.size, train=False, background_only=True, **vkw)]
     val_negatives = read_list(args.val_negatives)
     if val_negatives:
-        val_parts.append(NegativeImages(val_negatives, args.size, train=False))
+        val_parts.append(NegativeImages(val_negatives, args.size, train=False, **vkw))
     val_set = ConcatDataset(val_parts)
     val_loader = DataLoader(val_set, batch_size=args.batch, num_workers=args.workers, pin_memory=True)
 
-    model = HandSegNet(pretrained=not args.no_pretrained and args.init is None).to(device)
+    model = HandSegNet(args.encoder, pretrained=not args.no_pretrained and args.init is None,
+                       in_chans=4 if args.prev_mask else 3, aux_classes=AUX_CLASSES if args.aux else 0).to(device)
     if args.init:
-        model.load_state_dict(torch.load(args.init, map_location=device))
+        load_init(model, torch.load(args.init, map_location=device))
     print(f"HandSegNet {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.epochs * len(train_loader),
@@ -153,7 +205,7 @@ def main() -> None:
 
     with log_path.open("w", newline="") as log_file:
         log = csv.DictWriter(log_file, fieldnames=["epoch", "train_loss", "val_loss", "iou", "f@2px", "p95_px",
-                                                   "present_acc", "neg_fp_rate", "sec"])
+                                                   "present_acc", "neg_fp_rate", "hand_iou", "hand_recall", "sec"])
         log.writeheader()
         for epoch in range(1, args.epochs + 1):
             t0 = time.perf_counter()
@@ -162,8 +214,8 @@ def main() -> None:
             for x, m, present in train_loader:
                 x, m, present = (t.to(device, non_blocking=True) for t in (x, m, present))
                 with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
-                    mask_logits, present_logit = model(x)
-                loss = loss_fn(mask_logits, present_logit, m, present)
+                    out = model(x)
+                loss = loss_fn(out[0], out[1], m, present, out[2] if len(out) > 2 else None)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
@@ -179,7 +231,11 @@ def main() -> None:
                 if k != "epoch":
                     writer.add_scalar(k, v, epoch)
             # Best = boundary quality on hands x getting "is there a hand" right.
-            selection = metrics["f@2px"] * metrics["present_acc"]
+            # Hands are the priority when hand labels exist: hand accuracy counts double.
+            if metrics["hand_iou"] == metrics["hand_iou"]:
+                selection = (metrics["iou"] + 2 * metrics["hand_iou"]) / 3 * metrics["present_acc"]
+            else:
+                selection = metrics["f@2px"] * metrics["present_acc"]
             improved = selection > best_f2
             if improved:
                 best_f2 = selection
@@ -189,13 +245,14 @@ def main() -> None:
             print(f"epoch {epoch:3d}  train {row['train_loss']:.4f}  val {metrics['val_loss']:.4f}  "
                   f"IoU {metrics['iou']:.4f}  F@2px {metrics['f@2px']:.4f}  p95 {metrics['p95_px']:.2f}px  "
                   f"present {metrics['present_acc']:.3f}  negFP {metrics['neg_fp_rate']:.3f}  "
+                  f"hand IoU {metrics['hand_iou']:.4f} recall {metrics['hand_recall']:.4f}  "
                   f"({row['sec']:.0f}s){'  *best' if improved else ''}", flush=True)
 
     if not args.no_export:
         from segkit.export import PteRunner, export_pte
         model.load_state_dict(torch.load(args.out / "best.pt", map_location="cpu"))
         deploy = ProbabilityHead(model.cpu()).eval()
-        x = torch.randn(1, 3, args.size, args.size)
+        x = torch.randn(1, 4 if args.prev_mask else 3, args.size, args.size)
         pte = export_pte(deploy, x, args.out / f"{args.name}.pte")
         with torch.no_grad():
             eager = deploy(x)

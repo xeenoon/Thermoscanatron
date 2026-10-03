@@ -24,6 +24,10 @@ is vetoed from the hand outline, the colour reference and the arm, which keeps s
 Clean-up: pixels need SKIN_PROB of the parsing model's probability on the skin classes; blobs smaller than
 MIN_BLOB of the frame are dropped (fur, wood grain, skin-coloured paint), small holes are filled.
 
+Also writes hands/<stem>.png (0/255: the hand outlines alone, for hand-weighted training and hand metrics) and
+parse/<stem>.png (per pixel 0 background, 1 skin, 2 hair, 3 clothing/accessory: the parser's grouped classes, for the
+model's auxiliary "what else is this" head).
+
 Writes the hand-dataset layout (images/, masks/, overlays/, index.csv with flags), so segkit-validate,
 segkit-audit, segkit-train and the review/exclude.txt workflow all work unchanged. Flags: no_skin (empty mask:
 a negative), tiny (largest blob < 0.5% of the frame), dropped (clean-up removed > 20% of the raw skin), blurry.
@@ -46,6 +50,7 @@ MIN_BLOB = 0.0008                     # of the frame
 ARM_MAHAL = 3.0                       # arm pixel within this Mahalanobis distance of the hand's own colour
 ARM_PALMS = 2.0                       # arm extension reaches at most this many palm lengths past the wrist
 CLOTHES_CLASSES = (1, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17)   # hat, sunglasses, clothing, shoes, bag, scarf
+PERSON_NEG = 0.01                     # no-skin frame with this much hair/clothing -> not used as a negative
 CLOTHES_VETO = 0.6                    # ...and clothing must also beat skin; never inside the hand's own landmarks
 MIN_BLOB_CONF = 0.8                   # a parser-only blob also needs this mean skin probability (fur, wood)
 FILL_HOLES_BELOW = 0.002              # holes smaller than this (of the frame) inside a skin blob are filled
@@ -86,7 +91,35 @@ class HandOutlines:
             protect = cv2.dilate(protect, np.ones((k, k), np.uint8))
         blob[veto & (protect == 0)] = 0
         hand, _ = restrict_to_hands(blob, lms)
-        return extend_arm(rgb, blob, hand, lms)
+        # rembg merges a hand held over a face or shirt with what is behind it, and the hand box then cuts that
+        # into a rectangle. Keep only the part near the hand's own bones: palm polygon + thick finger lines
+        # (thumb included), grown a little for the finger edges.
+        hand = (hand > 0) & bone_zone(lms, hand.shape)
+        hand = hand.astype(np.uint8) * 255
+        return hand, extend_arm(rgb, blob, hand, lms)
+
+
+FINGERS = [(1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20)]
+
+
+def bone_zone(lms: list[np.ndarray], shape: tuple[int, int]) -> np.ndarray:
+    """Where each hand can be, from its 21 landmarks: palm polygon plus finger bones drawn ~0.5 palm widths thick."""
+    z = np.zeros(shape, np.uint8)
+    for lm in lms:
+        palm = float(np.hypot(*(lm[9] - lm[0])))
+        if palm < 2:
+            continue
+        p = np.round(lm).astype(np.int32)
+        cv2.fillConvexPoly(z, cv2.convexHull(p[[0, 1, 2, 5, 9, 13, 17]]), 1)
+        t = max(3, int(0.45 * palm))
+        for chain in FINGERS:
+            pts = [0, *chain] if chain[0] == 1 else list(chain)
+            for a, b in zip(pts[:-1], pts[1:]):
+                cv2.line(z, tuple(p[a]), tuple(p[b]), 1, t)
+            cv2.circle(z, tuple(p[chain[-1]]), t // 2 + 2, 1, -1)   # fingertip extends past its landmark
+        k = max(3, int(0.15 * palm) | 1)
+        z = cv2.dilate(z, np.ones((k, k), np.uint8))
+    return z > 0
 
 
 def extend_arm(rgb: np.ndarray, blob: np.ndarray, hand: np.ndarray, lms: list[np.ndarray]) -> np.ndarray:
@@ -124,14 +157,16 @@ class SkinParser:
         self.net = AutoModelForSemanticSegmentation.from_pretrained(name).to(self.device).eval()
 
     @torch.no_grad()
-    def skin_prob(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Per-pixel probability of skin and of clothing (sums over those classes), full resolution."""
+    def skin_prob(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per-pixel probability of skin and of clothing, and the grouped class map (0 bg, 1 skin, 2 hair, 3
+        clothing), full resolution."""
         inp = self.proc(images=np.ascontiguousarray(rgb), return_tensors="pt").to(self.device)
         logits = self.net(**inp).logits
         logits = torch.nn.functional.interpolate(logits, size=rgb.shape[:2], mode="bilinear", align_corners=False)
         sm = logits.softmax(1)[0]
-        return (sm[list(SKIN_CLASSES)].sum(0).float().cpu().numpy(),
-                sm[list(CLOTHES_CLASSES)].sum(0).float().cpu().numpy())
+        groups = torch.stack([sm[0], sm[list(SKIN_CLASSES)].sum(0), sm[2], sm[list(CLOTHES_CLASSES)].sum(0)])
+        return (groups[1].float().cpu().numpy(), groups[3].float().cpu().numpy(),
+                groups.argmax(0).to(torch.uint8).cpu().numpy())
 
 
 def clean(prob: np.ndarray, hands: np.ndarray | None = None) -> tuple[np.ndarray, float]:
@@ -209,7 +244,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--fps", type=float, default=5.0, help="frames per second taken from videos")
     args = ap.parse_args()
-    for sub in ("images", "masks", "overlays"):
+    for sub in ("images", "masks", "overlays", "hands", "parse"):
         (args.out / sub).mkdir(parents=True, exist_ok=True)
     index = args.out / "index.csv"
     done = set()
@@ -228,12 +263,24 @@ def main() -> None:
             for stem, rgb in frames(src, args.fps):
                 if stem in done:
                     continue
-                skin, clothes = parser.skin_prob(rgb)
-                mask, dropped = clean(skin, hand_outlines(rgb, skin, clothes))
+                skin, clothes, parse = parser.skin_prob(rgb)
+                ho = hand_outlines(rgb, skin, clothes)
+                hand_only, hands = (None, None) if ho is None else ho
+                mask, dropped = clean(skin, hands)
+                hand_mask = (np.zeros_like(mask) if hand_only is None
+                             else ((hand_only > 0) & (mask > 0)).astype(np.uint8) * 255)
+                parse[mask > 0] = 1
+                parse[(mask == 0) & (parse == 1)] = 0
+                cv2.imwrite(str(args.out / "hands" / f"{stem}.png"), hand_mask)
+                cv2.imwrite(str(args.out / "parse" / f"{stem}.png"), parse)
                 area = float((mask > 0).mean())
                 flags = []
                 if not mask.any():
                     flags.append("no_skin")
+                    # The parser misses extreme close-up faces and tiny distant people; a frame with a person's
+                    # hair or clothes in it is not a trustworthy "no skin" example.
+                    if np.isin(parse, (2, 3)).mean() > PERSON_NEG:
+                        flags.append("person_no_skin")
                 else:
                     _, _, st, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8))
                     if st[1:, cv2.CC_STAT_AREA].max() < TINY * mask.size:
