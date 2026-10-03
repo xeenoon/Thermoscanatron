@@ -1,5 +1,17 @@
 # EU-hack
 
+## Browser webcam demo
+
+A Python Gradio/FastRTC server runs the solar-panel tracker and hand-segmentation models while a laptop or phone browser streams the camera.
+
+```sh
+cd ML
+uv sync --extra cpu --extra web
+uv run --extra cpu --extra web segkit-panel-web
+```
+
+Open <http://127.0.0.1:7860>. See [ML/README.md](ML/README.md#browser-webcam-demo) for model overrides.
+
 ## 3D housing & structural studies
 
 CAD, STL and print files for the phone + thermal camera housing are in [3d/](3d/). The raw SolidWorks simulation output files are gitignored because they're large and can be regenerated.

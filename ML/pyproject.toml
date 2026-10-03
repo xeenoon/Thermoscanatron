@@ -14,7 +14,7 @@ dependencies = [
     "mediapipe>=1.0.1",
     "numpy>=2.5.2",
     "opencv-python>=5.0.0.93",
-    "pillow>=12.3.0",
+    "pillow>=11,<13",
     "pyyaml>=6.0.3",
     "rembg>=2.0.69",
     "segmentation-models-pytorch>=0.5.0",
@@ -28,6 +28,7 @@ dependencies = [
 [project.optional-dependencies]
 cpu = ["torch>=2.14.1", "torchvision>=0.29.1", "rembg[cpu]>=2.0.69"]
 cu130 = ["torch>=2.14.1", "torchvision>=0.29.1", "rembg[gpu]>=2.0.69"]
+web = ["fastrtc>=0.0.34", "gradio>=5.50,<6"]
 
 [project.scripts]
 segkit-hello-world = "segkit.hello_world:main"
@@ -46,6 +47,7 @@ segkit-panel-train = "segkit.panel.train:main"
 segkit-panel-track = "segkit.panel.track:main"
 segkit-panel-thermal = "segkit.panel.thermal:main"
 segkit-panel-twotier = "segkit.panel.twotier:main"
+segkit-panel-web = "segkit.panel.web:main"
 
 [tool.uv]
 conflicts = [[{ extra = "cpu" }, { extra = "cu130" }]]

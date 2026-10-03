@@ -8,6 +8,23 @@ uv run segkit-hello-world   # imports every dependency, runs one small op each; 
 uv run pytest               # unit tests
 ```
 
+### Browser webcam demo
+
+The Gradio/FastRTC demo runs the existing Python models on a server while a laptop or phone browser supplies the
+camera over WebRTC. Its selector switches between the stateful solar-panel cell tracker and HandSeg v3's live hand
+mask. It prefers training checkpoints and otherwise uses the models bundled in the Android apps; override those
+with `--model` / `SEGKIT_PANEL_MODEL` and `--hand-model` / `SEGKIT_HAND_MODEL`.
+
+```bash
+cd ML
+uv sync --extra cpu --extra web
+uv run --extra cpu --extra web segkit-panel-web
+# Open http://127.0.0.1:7860
+```
+
+For a remote Hugging Face Space, add an `HF_TOKEN` Space secret so FastRTC can obtain TURN credentials. Camera
+frames are processed in memory and are not recorded by the demo.
+
 ### Hand dataset (phone video -> frames -> rembg labels)
 
 Record with the Android app (`android-app/`, Options ▾ → Record video: silent 1080p video), then:
