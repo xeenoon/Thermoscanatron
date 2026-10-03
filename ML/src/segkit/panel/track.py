@@ -33,7 +33,8 @@ import torch
 from tqdm import tqdm
 
 from segkit.datasets.hands import IMAGENET_MEAN, IMAGENET_STD
-from segkit.datasets.panels import is_val, load_session, targets
+from segkit.datasets.panels import is_val, load_session, targets, session_is_crops
+from segkit.panel.replay import load_recording
 from segkit.panel import geometry as G
 from segkit.panel.spec import PanelSpec
 
@@ -66,7 +67,12 @@ class Model:
             self.run = lambda x: self.method.execute([x])
         else:
             from segkit.models.panelnet import PanelNet, PanelProbabilityHead
-            net = PanelNet()
+            arch = path.parent / "arch.txt"
+            if arch.exists():
+                encoder, decoder, _ = arch.read_text().split()
+                net = PanelNet(encoder, pretrained=False, decoder_channels=tuple(map(int, decoder.split(","))))
+            else:
+                net = PanelNet(pretrained=False)
             net.load_state_dict(torch.load(path, map_location="cpu"))
             head = PanelProbabilityHead(net).eval()
             self.run = lambda x: head(x)
@@ -394,6 +400,7 @@ def main() -> None:
     ap.add_argument("--crops", action="store_true",
                     help="run on the session's recorded analysis crops (exactly the phone's model input) instead "
                          "of video frames; no labels, prints the tracker's state timeline")
+    ap.add_argument("--recorded", action="store_true", help="with --crops, replay saved final H/mask/state without inference")
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--end", type=int, default=0)
     args = ap.parse_args()
@@ -451,16 +458,25 @@ def crop_labels(session: Path, n: int, size: int) -> list | None:
     """Label homographies (video frames) mapped onto the recorded analysis crops, nearest video frame in time."""
     if not (session / "panel_labels.npz").exists():
         return None
-    import csv
     import json
     from segkit.panel.thermal import video_geometry, video_times
     frames, Hs, valid, _ = load_session(session)
+    if session_is_crops(session):
+        recorded = load_recording(session, size)
+        by_name = {p.name: i for i, p in enumerate(frames)}
+        out = []
+        for record in recorded[:n]:
+            j = by_name[record.path.name]
+            image = cv2.imread(str(record.path))
+            A = np.diag([size / image.shape[1], size / image.shape[0], 1.])
+            out.append(A @ Hs[j] if valid[j] else None)
+        return out
     _, s, ox = video_geometry(session)
     vt = video_times(session, len(frames))
     an = json.loads((session / "meta.json").read_text())["analysis"]
     k = size / an["box_side"]
     A = np.array([[s * k, 0, (ox - an["box_left"]) * k], [0, s * k, -an["box_top"] * k], [0, 0, 1]])
-    ts = [int(r["sensor_ts_ns"]) for r in csv.DictReader((session / "frames.csv").open())]
+    ts = [r.sensor_ns for r in load_recording(session, size)]
     out = []
     for i in range(n):
         j = int(np.argmin(np.abs(vt - ts[i])))
@@ -470,20 +486,33 @@ def crop_labels(session: Path, n: int, size: int) -> list | None:
 
 def run_crops(args) -> None:
     """Replay the phone's own model input (session crops/, one per analysed camera frame) through the tracker."""
-    crops = sorted((args.session / "crops").glob("*.jpg"))
+    recorded = load_recording(args.session, args.size)
+    crops = [r.path for r in recorded]
     spec = PanelSpec()
-    model = Model(args.model, args.size)
+    model = None if args.recorded else Model(args.model, args.size)
     tracker = PanelTracker(spec, args.size, klt=not args.no_klt, block_match=args.block_match)
     labels = crop_labels(args.session, len(crops), args.size)
     writer = None
     if args.video:
+        args.video.parent.mkdir(parents=True, exist_ok=True)
         writer = cv2.VideoWriter(str(args.video), cv2.VideoWriter_fourcc(*"mp4v"), 10, (args.size, args.size))
     log, scored, fits = [], [], []
     for i in tqdm(range(args.start - 1, args.end or len(crops), args.stride)):
         crop = cv2.cvtColor(cv2.imread(str(crops[i])), cv2.COLOR_BGR2RGB)
-        dense, present = model(crop)
-        res = tracker.step(crop, dense, present)
-        log.append((i, res.state, res.centre_cell, present, float((dense[0] > 0.5).mean())))
+        crop = cv2.resize(crop, (args.size, args.size), interpolation=cv2.INTER_AREA)
+        record = recorded[i]
+        if args.recorded:
+            if record.mask is None or "fast_state" not in record.fields:
+                raise ValueError("--recorded requires a version 2 dump with final H/state and masks")
+            dense = np.zeros((6, args.size, args.size), np.float32)
+            dense[0] = record.mask
+            present = float(record.fields["present"])
+            res = Result(record.H, record.fields["state"].lower(),
+                         cell_at(record.H, spec, args.size / 2, args.size / 2) if record.H is not None else None)
+        else:
+            dense, present = model(crop)
+            res = tracker.step(crop, dense, present)
+        log.append((record.frame, res.state, res.centre_cell, present, float((dense[0] > 0.5).mean())))
         fits.append(tracker.last_frac)
         if labels is not None and labels[i] is not None:
             scored.append((res.centre_cell, cell_at(labels[i], spec, args.size / 2, args.size / 2)))
@@ -509,7 +538,7 @@ def run_crops(args) -> None:
     print(f"labelled crops with the centre on the panel: {len(on)}; tracker gives a cell in {len(said)} "
           f"({len(said) / max(1, len(on)):.0%}), correct {sum(c == l for c, l in said)}/{len(said)} "
           f"({sum(c == l for c, l in said) / max(1, len(said)):.1%})")
-    np.save(args.session / "track_crops.npy", np.array([(i, st, str(c), p, a) for i, st, c, p, a in log], dtype=object))
+    np.save(args.session / ("recorded_crops.npy" if args.recorded else "track_crops.npy"), np.array([(i, st, str(c), p, a) for i, st, c, p, a in log], dtype=object))
 
 
 if __name__ == "__main__":

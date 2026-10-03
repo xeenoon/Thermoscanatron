@@ -38,6 +38,7 @@ N_TARGETS = 6           # mask, lines, 4 x phase
 MIN_CROP = 0.12         # smallest training crop, as a fraction of the frame's short side
 PERSPECTIVE_P = 0.5     # share of training crops given an extra random perspective tilt
 PERSPECTIVE_JITTER = 0.15  # corner displacement, as a fraction of the crop side
+ROT90_P = 0.25          # with rot90: share of training crops turned a quarter, half or three-quarter turn
 
 
 def load_session(session: Path) -> tuple[list[Path], np.ndarray, np.ndarray, PanelSpec]:
@@ -46,6 +47,22 @@ def load_session(session: Path) -> tuple[list[Path], np.ndarray, np.ndarray, Pan
     spec = PanelSpec(**{**spec_d, "diamond_rows": tuple(spec_d["diamond_rows"])})
     frames = sorted((session / "frames").glob("*.jpg"))
     return frames, d["H"], d["valid"], spec
+
+
+def session_is_crops(session: Path) -> bool:
+    with np.load(session / "panel_labels.npz") as d:
+        return str(d.get("coordinate_space", "video")) == "analysis_crop"
+
+
+def grazing_transform(size: int, rng: np.random.Generator) -> np.ndarray:
+    """Project a plane tilted up to 72 degrees; retain positive depth and a convex quadrilateral."""
+    yaw, pitch = np.deg2rad(rng.uniform(-72, 72)), np.deg2rad(rng.uniform(-35, 35))
+    cy, sy, cp, sp = np.cos(yaw), np.sin(yaw), np.cos(pitch), np.sin(pitch)
+    rotation = np.array([[cy, sy * sp, sy * cp], [0, cp, -sp], [-sy, cy * sp, cy * cp]])
+    K = np.array([[size, 0, size / 2], [0, size, size / 2], [0, 0, 1.]])
+    plane = rotation.copy()
+    plane[:, 2] = [0, 0, size]
+    return K @ plane @ np.array([[1, 0, -size / 2], [0, 1, -size / 2], [0, 0, 1.]])
 
 
 def is_val(frame_index: int) -> bool:
@@ -85,13 +102,19 @@ def affine3(m: np.ndarray) -> np.ndarray:
 
 class PanelCrops(Dataset):
     def __init__(self, sessions: list[Path], split: str, size: int = 320, train: bool = True,
-                 negatives: list[Path] | None = None):
+                 negatives: list[Path] | None = None, grazing: bool = False, rot90: bool = False):
         self.size, self.train = size, train
+        self.grazing = grazing
+        # Phone held sideways or a panel lying on its side: the 20-degree crop jitter never gets there.
+        self.rot90 = rot90
+        self.crop_paths = set()
         self.items: list[tuple[Path, np.ndarray | None]] = []
         self.spec = None
         for s in sessions:
             frames, Hs, valid, spec = load_session(s)
             self.spec = self.spec or spec
+            if session_is_crops(s):
+                self.crop_paths.update(frames)
             for i, f in enumerate(frames):
                 if valid[i] and is_val(i) == (split == "val"):
                     self.items.append((f, Hs[i]))
@@ -137,16 +160,30 @@ class PanelCrops(Dataset):
             t = np.zeros((N_TARGETS, self.size, self.size), np.float32)
         else:
             h, w = rgb.shape[:2]
-            M = affine3(self.crop(w, h, rng))
+            if not self.train and path in self.crop_paths:
+                M = np.diag([self.size / w, self.size / h, 1.])
+            elif self.train and path in self.crop_paths and rng.random() < 0.5:
+                M = np.diag([self.size / w, self.size / h, 1.])
+            else:
+                M = affine3(self.crop(w, h, rng))
+            if self.train and self.rot90 and rng.random() < ROT90_P:
+                c = self.size / 2
+                R = cv2.getRotationMatrix2D((c, c), 90.0 * rng.integers(1, 4), 1.0)
+                M = affine3(R) @ M
             if self.train and rng.random() < PERSPECTIVE_P:
                 # Random off-angle view: move the crop's corners independently (a homography on top of the crop).
                 n = self.size
                 src = np.float32([[0, 0], [n, 0], [n, n], [0, n]])
                 dst = src + rng.uniform(-PERSPECTIVE_JITTER, PERSPECTIVE_JITTER, (4, 2)).astype(np.float32) * n
-                M = cv2.getPerspectiveTransform(src, dst).astype(np.float64) @ M
+                tilt = (grazing_transform(n, rng) if self.grazing and rng.random() < 0.5 else
+                        cv2.getPerspectiveTransform(src, dst).astype(np.float64))
+                M = tilt @ M
             img = cv2.warpPerspective(rgb, M, (self.size, self.size), flags=cv2.INTER_AREA,
-                                      borderMode=cv2.BORDER_REFLECT_101)
+                                      borderMode=cv2.BORDER_CONSTANT)
             t = targets(M @ H, self.size, self.spec)
+            support = cv2.warpPerspective(np.ones((h, w), np.uint8), M, (self.size, self.size),
+                                          flags=cv2.INTER_NEAREST)
+            t *= support[None]
         if self.train:
             img = self.photometric(image=img)["image"]
         present = torch.tensor([float(t[0].mean() >= PRESENT_MIN_FRACTION)])

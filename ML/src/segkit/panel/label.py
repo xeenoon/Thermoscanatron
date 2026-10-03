@@ -6,7 +6,8 @@ anchors.json: {"<frame>": anchor, ...}, frame numbers as in frames/NNNNN.jpg (1-
 anchor is either [[x, y] x4]: the cell-area corners TL, TR, BR, BL with cell (0, 0) at TL, or
 {"points": [[u, v, x, y], ...]}: four or more panel points (diamonds are easiest: u = 1..cols-1 on the
 diamond rows) and where they are in the image, which also works when corners are out of frame.
-Rough clicks are fine: each anchor is snapped onto the gridlines and diamonds first.
+Rough clicks are snapped onto gridlines and diamonds first. Reviewed point anchors can set "snap": false
+to preserve deliberate clicks (especially at low resolution or grazing angles).
 An optional "reject": [[first, last], ...] lists frame ranges found wrong in review; they stay unlabelled.
 
 From every anchor the panel is tracked forwards and backwards: KLT corners inside the panel give a
@@ -170,22 +171,33 @@ def run_track(paths: list[Path], start: int, H0: np.ndarray, step: int, stop: se
 
 
 def review_sheets(session: Path, paths: list[Path], Hs: np.ndarray, valid: np.ndarray, spec: PanelSpec,
-                  every: int = 20, per_sheet: int = 40) -> None:
+                  every: int = 20, per_sheet: int = 24) -> None:
+    """Clean crop beside a thin grid, preserving aspect ratio and visible cell details."""
     out = session / "review"
     out.mkdir(exist_ok=True)
     idx = list(range(0, len(paths), every))
     for k in range(0, len(idx), per_sheet):
         tiles = []
         for i in idx[k:k + per_sheet]:
-            im = cv2.imread(str(paths[i]))
+            raw = cv2.imread(str(paths[i]))
+            scale = 192 / raw.shape[1]
+            im = cv2.resize(raw, (192, round(raw.shape[0] * scale)))
+            overlay = im.copy()
             if valid[i]:
-                draw_cells(im, Hs[i], spec)
-            cv2.putText(im, str(i + 1), (10, 50), 0, 1.6, (0, 255, 255) if valid[i] else (0, 0, 255), 3)
-            tiles.append(cv2.resize(im, (216, 384)))
-        while len(tiles) % 10:
+                H = np.diag([scale, scale, 1.]) @ Hs[i]
+                segments = [((u, 0), (u, spec.rows)) for u in range(spec.cols + 1)]
+                segments += [((0, v), (spec.cols, v)) for v in range(spec.rows + 1)]
+                for segment in segments:
+                    pts = np.round(G.project(H, np.array(segment))).astype(int)
+                    cv2.line(overlay, tuple(pts[0]), tuple(pts[1]), (0, 0, 255), 1)
+            tile = cv2.copyMakeBorder(np.hstack([im, overlay]), 24, 0, 0, 0, cv2.BORDER_CONSTANT)
+            text = f"{paths[i].stem} anchor {i + 1} " + ("VALID" if valid[i] else "excluded")
+            cv2.putText(tile, text, (4, 17), 0, .45, (255, 255, 255), 1)
+            tiles.append(tile)
+        while len(tiles) % 4:
             tiles.append(np.zeros_like(tiles[0]))
         cv2.imwrite(str(out / f"sheet_{k // per_sheet:02d}.jpg"),
-                    np.vstack([np.hstack(tiles[r:r + 10]) for r in range(0, len(tiles), 10)]))
+                    np.vstack([np.hstack(tiles[r:r + 4]) for r in range(0, len(tiles), 4)]))
 
 
 def draw_cells(im: np.ndarray, H: np.ndarray, spec: PanelSpec, colour=(0, 0, 255)) -> None:
@@ -218,6 +230,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("session", type=Path)
     ap.add_argument("--anchors", type=Path)
+    ap.add_argument("--crop-input", action="store_true", help="frames are already phone analysis crops")
+    ap.add_argument("--review-every", type=int, default=20, help="use 1 to review every frame")
     ap.add_argument("--spec", type=Path, help="panel profile JSON (default: built-in)")
     args = ap.parse_args()
     spec = PanelSpec.load(args.spec)
@@ -236,7 +250,14 @@ def main() -> None:
     for a, quad in tqdm(sorted(anchor_idx.items()), desc="anchors"):
         g = grays.setdefault(a, cv2.cvtColor(cv2.imread(str(paths[a])), cv2.COLOR_BGR2GRAY))
         H0 = quad
-        H, r, _ = snap(H0, g, spec)
+        anchor = anchors[str(a + 1)]
+        if isinstance(anchor, dict) and anchor.get("snap") is False:
+            H, r = H0, lattice_residual(H0, g, spec)
+        else:
+            H, r, ok = snap(H0, g, spec)
+            if not ok:
+                print(f"warning: anchor {a + 1} snap rejected; preserving its clicks")
+                H, r = H0, lattice_residual(H0, g, spec)
         moved = np.abs(G.unproject(H, G.project(H0, G.corners(spec))) - G.corners(spec)).max()
         if moved > ANCHOR_MAX_SNAP_CELLS:
             print(f"warning: anchor {a + 1} snapped {moved:.2f} cells from its clicks; check its corners")
@@ -258,9 +279,10 @@ def main() -> None:
     for i, (H, r, src) in best.items():
         Hs[i], valid[i], resid[i], source[i] = H, True, r, src
     np.savez(args.session / "panel_labels.npz", H=Hs, valid=valid, resid_cells=resid, source=source,
+             coordinate_space="analysis_crop" if args.crop_input else "video",
              spec=json.dumps(spec.__dict__ | {"diamond_rows": list(spec.diamond_rows)}))
     print(f"{valid.sum()}/{n} frames labelled; resid median {np.median(resid[valid & np.isfinite(resid)]):.3f} cells")
-    review_sheets(args.session, paths, Hs, valid, spec)
+    review_sheets(args.session, paths, Hs, valid, spec, every=args.review_every)
 
 
 if __name__ == "__main__":

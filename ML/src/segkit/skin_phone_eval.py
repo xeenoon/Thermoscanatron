@@ -47,6 +47,10 @@ def main() -> None:
             if any(r["stem"].startswith(v + "_f") for v in args.stems_from)
             and (args.all_frames or is_val(r["stem"]))
             and "person_no_skin" not in r["flags"].split("|")]
+    ex = args.dataset / "exclude.txt"
+    if ex.exists():
+        bad = {l.split("#")[0].strip() for l in ex.read_text().splitlines()}
+        rows = [r for r in rows if r["stem"] not in bad]
     rows.sort(key=lambda r: r["stem"])
     frames = []
     for r in rows:

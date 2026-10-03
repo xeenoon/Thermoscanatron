@@ -9,6 +9,7 @@ cell area only) and panel-present (BCE). Validation reports cell-area IoU, the m
 
 import argparse
 import csv
+import json
 import math
 import time
 from pathlib import Path
@@ -112,16 +113,25 @@ def main() -> None:
     p.add_argument("--decoder", default="96,64,32", help="decoder channels at 1/16, 1/8, 1/4")
     p.add_argument("--name", default="panelseg", help="exported file name (<name>.pte)")
     p.add_argument("--no-export", action="store_true")
+    p.add_argument("--grazing", action="store_true", help="add physical plane tilts up to 72 degrees")
+    p.add_argument("--rot90", action="store_true", help="also train on quarter-turned views (phone held sideways)")
+    p.add_argument("--val-sessions", type=Path, nargs="+", help="checkpoint selection sessions; other validation blocks remain untouched")
+    p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    cv2.setNumThreads(1)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "config.json").write_text(json.dumps(vars(args), default=str, indent=2) + "\n")
     negatives = read_list(args.negatives)
     n_val_neg = len(negatives) // 10
     rng = np.random.default_rng(0)
     rng.shuffle(negatives)
-    train_set = PanelCrops(args.sessions, "train", args.size, True, negatives[n_val_neg:])
-    val_set = PanelCrops(args.sessions, "val", args.size, False, negatives[:n_val_neg])
+    train_set = PanelCrops(args.sessions, "train", args.size, True, negatives[n_val_neg:], grazing=args.grazing,
+                           rot90=args.rot90)
+    val_set = PanelCrops(args.val_sessions or args.sessions, "val", args.size, False, negatives[:n_val_neg])
     print(f"device {device}  train {train_set.n_panel} panel + {len(train_set) - train_set.n_panel} negative  "
           f"val {val_set.n_panel} + {len(val_set) - val_set.n_panel}  size {args.size}")
     n_neg = len(train_set) - train_set.n_panel
