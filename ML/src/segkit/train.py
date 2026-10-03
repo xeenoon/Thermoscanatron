@@ -96,6 +96,8 @@ def main() -> None:
     p.add_argument("--init", type=Path, help="start from these weights (fine-tune), e.g. the 384 px model's best.pt "
                                              "for the phone's small fast-path model at --size 192")
     p.add_argument("--name", default="handseg", help="exported file name (<name>.pte)")
+    p.add_argument("--skin-tone-aug", type=float, default=0.0,
+                   help="share of training crops whose labelled skin is recoloured to a random tone (segkit.skin_tone)")
     p.add_argument("--no-export", action="store_true")
     args = p.parse_args()
 
@@ -115,7 +117,8 @@ def main() -> None:
     print("train frames per session: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     negatives = read_list(args.negatives)
     weights = [1.0 / counts[k] for k in sessions]
-    train_set = HandCrops(args.dataset, train_stems, args.size, train=True, negatives=negatives)
+    train_set = HandCrops(args.dataset, train_stems, args.size, train=True, negatives=negatives,
+                          skin_tone_p=args.skin_tone_aug)
     if negatives:
         # Hand frames keep their total weight; negatives get negative_share of the draws, spread evenly.
         own = sum(weights)

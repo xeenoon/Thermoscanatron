@@ -15,6 +15,12 @@ patchy). So where MediaPipe finds a hand, the old hand labeller's outline is add
 landmarks, cut at the wrist and boxed to the hand (segkit.label_rembg.restrict_to_hands) - which keeps sleeves
 out. Skin mask = parser skin OR hand outlines.
 
+Bare forearms: past the wrist cut, the rest of rembg's blob (arm, or sleeve) is kept only where it matches the
+colour of that person's own hand: Mahalanobis distance in CIELAB to the cut hand's pixels below ARM_MAHAL, and
+connected to the hand, within ARM_PALMS palm lengths of the wrist. The reference is the person's own skin, never a
+fixed skin colour, so this treats every skin tone alike. Anything the parser calls clothing (prob > CLOTHES_VETO)
+is vetoed from the hand outline, the colour reference and the arm, which keeps sleeves and hoodies out.
+
 Clean-up: pixels need SKIN_PROB of the parsing model's probability on the skin classes; blobs smaller than
 MIN_BLOB of the frame are dropped (fur, wood grain, skin-coloured paint), small holes are filled.
 
@@ -37,6 +43,10 @@ PARSER = "mattmdjaga/segformer_b2_clothes"
 SKIN_CLASSES = (11, 12, 13, 14, 15)   # Face, Left-leg, Right-leg, Left-arm, Right-arm
 SKIN_PROB = 0.5
 MIN_BLOB = 0.0008                     # of the frame
+ARM_MAHAL = 3.0                       # arm pixel within this Mahalanobis distance of the hand's own colour
+ARM_PALMS = 2.0                       # arm extension reaches at most this many palm lengths past the wrist
+CLOTHES_CLASSES = (1, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17)   # hat, sunglasses, clothing, shoes, bag, scarf
+CLOTHES_VETO = 0.6                    # ...and clothing must also beat skin; never inside the hand's own landmarks
 MIN_BLOB_CONF = 0.8                   # a parser-only blob also needs this mean skin probability (fur, wood)
 FILL_HOLES_BELOW = 0.002              # holes smaller than this (of the frame) inside a skin blob are filled
 TINY = 0.005
@@ -58,7 +68,7 @@ class HandOutlines:
         providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
         self.session = new_session("birefnet-general-lite", providers=providers)
 
-    def __call__(self, rgb: np.ndarray) -> np.ndarray | None:
+    def __call__(self, rgb: np.ndarray, skin: np.ndarray, clothes: np.ndarray) -> np.ndarray | None:
         from PIL import Image
         from rembg import remove
         from segkit.label_rembg import keep_components, restrict_to_hands
@@ -66,9 +76,44 @@ class HandOutlines:
         if not lms:
             return None
         alpha = np.asarray(remove(Image.fromarray(rgb), session=self.session, only_mask=True))
-        mask, _ = keep_components(alpha, lms)
-        mask, _ = restrict_to_hands(mask, lms)
-        return mask
+        blob, _ = keep_components(alpha, lms)
+        veto = (clothes > CLOTHES_VETO) & (clothes > skin)
+        protect = np.zeros(blob.shape, np.uint8)
+        for lm in lms:
+            cv2.fillConvexPoly(protect, cv2.convexHull(lm.astype(np.int32)), 1)
+            palm = float(np.hypot(*(lm[9] - lm[0])))
+            k = max(3, int(0.3 * palm) | 1)
+            protect = cv2.dilate(protect, np.ones((k, k), np.uint8))
+        blob[veto & (protect == 0)] = 0
+        hand, _ = restrict_to_hands(blob, lms)
+        return extend_arm(rgb, blob, hand, lms)
+
+
+def extend_arm(rgb: np.ndarray, blob: np.ndarray, hand: np.ndarray, lms: list[np.ndarray]) -> np.ndarray:
+    """Add the part of the rembg blob past the wrist that has the hand's own skin colour and touches the hand."""
+    h = hand > 0
+    near = np.zeros_like(h)
+    ys, xs = np.mgrid[0:h.shape[0], 0:h.shape[1]]
+    for lm in lms:
+        palm = float(np.hypot(*(lm[9] - lm[0])))
+        near |= np.hypot(xs - lm[0][0], ys - lm[0][1]) < ARM_PALMS * palm
+    rest = (blob > 0) & ~h & near
+    if h.sum() < 200 or not rest.any():
+        return hand
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ref = lab[cv2.erode(h.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0]
+    if len(ref) < 100:
+        ref = lab[h]
+    mu = ref.mean(0)
+    cov = np.cov(ref.T) + np.eye(3) * 4.0
+    d = lab[rest] - mu
+    m2 = np.einsum("ij,jk,ik->i", d, np.linalg.inv(cov), d)
+    cand = np.zeros_like(h)
+    cand[rest] = m2 < ARM_MAHAL ** 2
+    cand = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)) > 0
+    n, cc = cv2.connectedComponents((cand | h).astype(np.uint8))
+    keep = np.unique(cc[h])
+    return (np.isin(cc, keep[keep > 0]) & (cand | h)).astype(np.uint8) * 255
 
 
 class SkinParser:
@@ -79,13 +124,14 @@ class SkinParser:
         self.net = AutoModelForSemanticSegmentation.from_pretrained(name).to(self.device).eval()
 
     @torch.no_grad()
-    def skin_prob(self, rgb: np.ndarray) -> np.ndarray:
-        """Per-pixel probability of skin (sum over the skin classes), full resolution."""
+    def skin_prob(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Per-pixel probability of skin and of clothing (sums over those classes), full resolution."""
         inp = self.proc(images=np.ascontiguousarray(rgb), return_tensors="pt").to(self.device)
         logits = self.net(**inp).logits
         logits = torch.nn.functional.interpolate(logits, size=rgb.shape[:2], mode="bilinear", align_corners=False)
-        p = logits.softmax(1)[0, list(SKIN_CLASSES)].sum(0)
-        return p.float().cpu().numpy()
+        sm = logits.softmax(1)[0]
+        return (sm[list(SKIN_CLASSES)].sum(0).float().cpu().numpy(),
+                sm[list(CLOTHES_CLASSES)].sum(0).float().cpu().numpy())
 
 
 def clean(prob: np.ndarray, hands: np.ndarray | None = None) -> tuple[np.ndarray, float]:
@@ -182,8 +228,8 @@ def main() -> None:
             for stem, rgb in frames(src, args.fps):
                 if stem in done:
                     continue
-                hands = hand_outlines(rgb)
-                mask, dropped = clean(parser.skin_prob(rgb), hands)
+                skin, clothes = parser.skin_prob(rgb)
+                mask, dropped = clean(skin, hand_outlines(rgb, skin, clothes))
                 area = float((mask > 0).mean())
                 flags = []
                 if not mask.any():

@@ -22,6 +22,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from segkit.skin_tone import random_tone, recolour
+
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -126,9 +128,10 @@ class HandCrops(Dataset):
     background_only, a seeded crop that misses the hand (validation negatives)."""
 
     def __init__(self, dataset: Path, stems: list[str], size: int = 384, train: bool = True,
-                 background_only: bool = False, negatives: list[Path] | None = None):
+                 background_only: bool = False, negatives: list[Path] | None = None, skin_tone_p: float = 0.0):
         self.dataset, self.stems, self.size, self.train = dataset, stems, size, train
         self.background_only = background_only
+        self.skin_tone_p = skin_tone_p   # share of training crops whose labelled skin gets a random tone
         self.negatives = negatives or []
         self.photometric = A.Compose([
             A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05, p=0.8),
@@ -218,6 +221,8 @@ class HandCrops(Dataset):
                 img = (alpha * img + (1 - alpha) * bg).astype(np.uint8)
 
         if self.train:
+            if self.skin_tone_p and msk.any() and rng.random() < self.skin_tone_p:
+                img = recolour(np.ascontiguousarray(img), msk, *random_tone(rng))
             if rng.random() < 0.5:
                 img, msk = img[:, ::-1], msk[:, ::-1]
             img = self.photometric(image=np.ascontiguousarray(img))["image"]
