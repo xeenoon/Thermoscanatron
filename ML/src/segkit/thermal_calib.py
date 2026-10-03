@@ -12,8 +12,9 @@ features and a phone-mounted sensor is not a planar scene, so this fits a full t
 Model
   phone camera  pinhole; intrinsics from Camera2 (meta.json); coordinates of the upright analysis frame
                 (x right, y down, z forward), centimetres.
-  thermal       MLX90640-BAB (Adafruit 4407), 55x35 deg, equidistant: angle from axis = radius / f, focal
-                lengths from the datasheet field of view times one fitted scale k; optionally mirrored.
+  thermal       MLX90640ESF-BAB (Adafruit 4407), equidistant: angle from axis = radius / f, focal lengths
+                from the MEASURED field of view (FOV_X_DEG x FOV_Y_DEG, see below) times one fitted scale k;
+                mirrored readout (datasheet Figure 3: column 1 is on the right as the sensor looks out).
   pose          thermal axes in camera coordinates R = Ry(yaw) @ Rx(pitch) @ Rz(roll): yaw + turns the
                 thermal camera right, pitch + up, roll + clockwise as seen from behind the phone.
                 Thermal centre at c = (x, y, z) cm: x right, y down, z forward of the phone lens.
@@ -62,8 +63,14 @@ from scipy.optimize import least_squares, minimize
 
 TW, TH = 32, 24
 T_CX, T_CY = (TW - 1) / 2, (TH - 1) / 2
-T_FX = (TW / 2) / np.radians(55 / 2)    # px per radian across the 55 deg axis
-T_FY = (TH / 2) / np.radians(35 / 2)    # px per radian across the 35 deg axis
+# Field of view MEASURED on this sensor (soldering-iron point source, session 20261002_171833, 126 pairs,
+# equidistant model, bootstrap 95%): 49.7 (49.3-50.0) x 38.3 (37.9-39.0) deg. The datasheet's "typical"
+# 55 x 35 deg (Table 15) is defined at the 50%-sensitivity edge of the whole array, not by pixel-centre
+# spacing, and put the hand calibration ~2-3 thermal px off. Lens shape: equidistant fits slightly better
+# than pinhole (median 0.44 vs 0.47 px); the datasheet does not specify it.
+FOV_X_DEG, FOV_Y_DEG = 49.7, 38.3
+T_FX = (TW / 2) / np.radians(FOV_X_DEG / 2)    # px per radian, horizontal (32 px)
+T_FY = (TH / 2) / np.radians(FOV_Y_DEG / 2)    # px per radian, vertical (24 px)
 BLUR_PX = 0.8                           # thermal optics point-spread, in thermal pixels
 HAND_AREA_CM2 = 130.0                   # silhouette area of an open adult hand, palm + fingers
 MASK_GRID = 96                          # crop mask resolution used for fitting (384 / 4)

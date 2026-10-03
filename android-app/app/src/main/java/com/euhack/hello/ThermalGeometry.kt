@@ -16,8 +16,9 @@ data class CameraIntrinsics(val f: Double, val cx: Double, val cy: Double)
  *  - thermal axes in camera coordinates R = Ry(yaw) Rx(pitch) Rz(roll): yaw + turns the thermal camera
  *    right, pitch + up, roll + clockwise as seen from behind the phone;
  *  - thermal centre at (x, y, z) cm;
- *  - thermal lens: MLX90640-BAB 55x35 deg, equidistant (angle from axis = radius / f), focal lengths from
- *    the datasheet field of view times exp(logK); [mirror] flips the sensor's x axis.
+ *  - thermal lens: MLX90640ESF-BAB, equidistant (angle from axis = radius / f), focal lengths from the
+ *    measured field of view ([ThermalGeometry.FOV_X_DEG] x [ThermalGeometry.FOV_Y_DEG]) times exp(logK);
+ *    [mirror] flips the sensor's x axis (datasheet Figure 3: column 1 is on the right, looking out).
  */
 class ThermalPose(
     val yaw: Double, val pitch: Double, val roll: Double,
@@ -71,8 +72,15 @@ object ThermalGeometry {
     const val H = 24
     const val CX = (W - 1) / 2.0
     const val CY = (H - 1) / 2.0
-    val FX = (W / 2) / Math.toRadians(55.0 / 2)   // px per radian across the 55 deg axis
-    val FY = (H / 2) / Math.toRadians(35.0 / 2)   // px per radian across the 35 deg axis
+    /**
+     * Field of view MEASURED on this sensor with a soldering-iron point source (session 20261002_171833,
+     * 126 pairs, bootstrap 95%): 49.7 (49.3-50.0) x 38.3 (37.9-39.0) deg. The datasheet's "typical" 55 x 35
+     * (Table 15) is defined at the 50%-sensitivity edge of the whole array, not by pixel-centre spacing.
+     */
+    const val FOV_X_DEG = 49.7
+    const val FOV_Y_DEG = 38.3
+    val FX = (W / 2) / Math.toRadians(FOV_X_DEG / 2)   // px per radian, horizontal (32 px)
+    val FY = (H / 2) / Math.toRadians(FOV_Y_DEG / 2)   // px per radian, vertical (24 px)
 
     /** Row-major 3x3 Ry(yaw) Rx(pitch) Rz(roll). */
     fun rotation(yaw: Double, pitch: Double, roll: Double): DoubleArray {

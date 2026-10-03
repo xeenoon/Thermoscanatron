@@ -200,13 +200,14 @@ class ThermalCalibrationTest {
         val p = r.pose.toArray()
         println("phone solver: mirror=${r.pose.mirror} yaw/pitch/roll ${(0..2).map { Math.toDegrees(p[it]) }} " +
             "xyz ${p.slice(3..5)} k ${exp(p[6])} latency ${r.latencyMs} corr ${r.correlation} pairs ${r.pairs}")
-        // Python (runs/thermal_calib): yaw -3.6, pitch 3.1, roll 94.8 deg, x -0.4, y 3.8, z -1.4 cm, corr 0.81.
-        // The correlation peak is flat to ~2-3 deg / ~1.5 cm with hands at 20-30 cm, so agree to that.
+        // Python (runs/thermal_calib, measured 49.7 x 38.3 deg field of view): yaw -4.3, pitch 6.6, roll 97.9 deg,
+        // x -0.2, y 5.2, z -0.3 cm, corr 0.830. The correlation peak is flat to ~2-3 deg / ~1.5 cm with hands at
+        // 20-30 cm, so agree to that.
         assertTrue(r.pose.mirror)
-        assertEquals(-3.6, Math.toDegrees(p[0]), 3.0)
-        assertEquals(3.1, Math.toDegrees(p[1]), 3.0)
-        assertEquals(94.8, Math.toDegrees(p[2]), 2.0)
-        assertEquals(3.8, p[4], 2.0)
+        assertEquals(-4.3, Math.toDegrees(p[0]), 3.0)
+        assertEquals(6.6, Math.toDegrees(p[1]), 3.0)
+        assertEquals(97.9, Math.toDegrees(p[2]), 2.0)
+        assertEquals(5.2, p[4], 2.0)
         assertTrue(r.correlation > 0.80)
     }
 }
