@@ -23,4 +23,9 @@ We ran two SolidWorks static studies. Each one applies 100 N to opposite sides o
 | 1 | Large section of the phone attachment | 13.18 MPa | 0.0486 mm | 0.206% |
 | 2 | Only the phone-gripping hooks (more realistic), with revised CAD | **1.25 MPa** | **0.0149 mm** | **0.026%** |
 
-Study 2 is the more realistic support case and uses the revised design. Compared with study 1 it shows **~90% less stress, ~69% less displacement and ~87% less strain**. In both studies the housing barely deforms under a hard pull.
+Study 2 is the more realistic support case and uses the revised design. Compared with study 1 it shows **~90% less stress, ~69% less displacement and ~87% less strain**, which means the revised housing is much stiffer and spreads the load better.
+
+What the numbers mean:
+- **Von Mises stress**: how close the material is to yielding (permanently bending or breaking).
+- **Displacement**: how far the structure moves under the load.
+- **Strain**: how much the material stretches or squashes locally.
