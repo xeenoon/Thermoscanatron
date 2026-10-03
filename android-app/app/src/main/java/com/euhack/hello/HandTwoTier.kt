@@ -1,6 +1,7 @@
 package com.euhack.hello
 
 import android.os.Process
+import android.os.Debug
 import android.os.SystemClock
 import android.util.Log
 import org.pytorch.executorch.EValue
@@ -10,9 +11,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * HandSegNet as two models: the small one (same network at [smallSize] px, fine-tuned from the big one;
- * segkit-train --size 256 --prev-mask --init) on every camera frame, the big one ([size] px) on a low-priority background
- * thread whenever it is free.
+ * The small HandSegNet runs every camera frame with four native threads. The big model is disabled by default;
+ * diagnostic launches can enable it on a low-priority background thread whenever it is free.
  *
  * The outline always comes from the small model on the current frame: a hand moves on its own, so any mask from
  * an earlier frame is drawn where the hand used to be (moving it by the camera's motion does not help when the
@@ -21,24 +21,34 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  - small says hand, big is sure there is none (< [VETO]): no hand (the small model's false positives);
  *  - small is unsure (> [MAYBE]) and big is sure there is one (> [CONFIRM]): hand (side-on and blurred hands).
  *
- * The two models get separate thread budgets ([SMALL_THREADS], [BIG_THREADS]) so the background one cannot
- * starve the one the camera waits for. Not thread-safe: call [run] from the analysis thread.
+ * ExecuTorch Android 1.5.1 uses a process-wide pool: loading the big module last resets the thread count
+ * for BOTH models. A Java background thread does not isolate its native inference work.
+ * Not thread-safe: call [run] from the analysis thread.
  */
-class HandTwoTier(smallPath: String, bigPath: String, private val size: Int, val smallSize: Int,
-                  private val prevMaskInput: Boolean = true) {
+class HandTwoTier(smallPath: String, bigPath: String?, private val size: Int, val smallSize: Int,
+                  private val prevMaskInput: Boolean = true,
+                  private val backgroundEnabled: Boolean = false,
+                  smallThreads: Int = SMALL_THREADS, bigThreads: Int = BIG_THREADS,
+                  private val diagnostics: Boolean = false) {
     class Result(val mask: FloatArray, val present: Float, val smallPresent: Float, val bigPresent: Float?,
                  val smallMs: Long, val bigMs: Long)
 
-    private val small = Module.load(smallPath, Module.LOAD_MODE_FILE, SMALL_THREADS)
-    private val big = Module.load(bigPath, Module.LOAD_MODE_FILE, BIG_THREADS)
+    private val small = Module.load(smallPath, Module.LOAD_MODE_FILE, smallThreads)
+    // Do not load an idle big module: its load would still reset the small model's native thread pool.
+    private val big = if (backgroundEnabled) Module.load(requireNotNull(bigPath), Module.LOAD_MODE_FILE, bigThreads) else null
+
+    init {
+        Log.i("HandPerf", "config background=$backgroundEnabled smallThreads=$smallThreads bigThreads=${if (big != null) bigThreads else 0} " +
+            "smallSize=$smallSize bigSize=$size diagnostics=$diagnostics (thread pool is shared; last load wins)")
+    }
     // Small model input: RGB plus (prevMaskInput) the previous frame's mask as a 4th channel, so it can carry a
     // thumb or a blurred hand over from the last frame instead of starting from nothing every frame.
     private val inputSmall = FloatArray((if (prevMaskInput) 4 else 3) * smallSize * smallSize)
     private val channels = if (prevMaskInput) 4L else 3L
-    private val inputBig = FloatArray(3 * size * size)
-    private val executor = Executors.newSingleThreadExecutor { r ->
+    private val inputBig = if (big != null) FloatArray(3 * size * size) else null
+    private val executor = if (big != null) Executors.newSingleThreadExecutor { r ->
         Thread({ Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND); r.run() }, "hand-big")
-    }
+    } else null
     private val busy = AtomicBoolean(false)
     private var frame = 0L
 
@@ -52,10 +62,17 @@ class HandTwoTier(smallPath: String, bigPath: String, private val size: Int, val
      */
     fun run(pixels: IntArray, bigPixels: () -> IntArray, mean: FloatArray, std: FloatArray): Result {
         val f = frame++
+        val tStart = SystemClock.elapsedRealtimeNanos()
+        val bigBusy = busy.get()
         normalise(pixels, inputSmall, smallSize, mean, std)
-        val t0 = SystemClock.elapsedRealtime()
-        val out = small.forward(EValue.from(Tensor.fromBlob(inputSmall, longArrayOf(1, channels, smallSize.toLong(), smallSize.toLong()))))
-        val smallMs = SystemClock.elapsedRealtime() - t0
+        val tNormalise = SystemClock.elapsedRealtimeNanos()
+        val value = EValue.from(Tensor.fromBlob(inputSmall, longArrayOf(1, channels, smallSize.toLong(), smallSize.toLong())))
+        val tInput = SystemClock.elapsedRealtimeNanos()
+        val cpuStart = if (diagnostics) Debug.threadCpuTimeNanos() else 0L
+        val out = small.forward(value)
+        val cpuNs = if (diagnostics) Debug.threadCpuTimeNanos() - cpuStart else 0L
+        val tForward = SystemClock.elapsedRealtimeNanos()
+        val smallMs = (tForward - tNormalise) / 1_000_000
         val mask = out[0].toTensor().dataAsFloatArray
         val pSmall = out[1].toTensor().dataAsFloatArray[0]
         if (prevMaskInput) {
@@ -63,7 +80,8 @@ class HandTwoTier(smallPath: String, bigPath: String, private val size: Int, val
             for (i in 0 until plane) inputSmall[3 * plane + i] = if (mask[i] > 0.5f) 1f else 0f
         }
 
-        if (busy.compareAndSet(false, true)) {
+        val tOutput = SystemClock.elapsedRealtimeNanos()
+        if (big != null && inputBig != null && executor != null && busy.compareAndSet(false, true)) {
             normalise(bigPixels(), inputBig, size, mean, std)
             executor.execute {
                 try {
@@ -78,6 +96,11 @@ class HandTwoTier(smallPath: String, bigPath: String, private val size: Int, val
                 }
             }
         }
+        val tBigPrep = SystemClock.elapsedRealtimeNanos()
+        if (diagnostics) Log.i("HandPerf", "frame=$f background=$backgroundEnabled bigBusyAtStart=$bigBusy " +
+            "normaliseUs=${(tNormalise - tStart) / 1000} inputUs=${(tInput - tNormalise) / 1000} " +
+            "forwardUs=${(tForward - tInput) / 1000} callerCpuUs=${cpuNs / 1000} " +
+            "outputUs=${(tOutput - tForward) / 1000} bigPrepUs=${(tBigPrep - tOutput) / 1000}")
 
         val b = latestBig?.takeIf { f - it.frame <= MAX_AGE }
         val present = when {
@@ -90,8 +113,8 @@ class HandTwoTier(smallPath: String, bigPath: String, private val size: Int, val
     }
 
     fun close() {
-        executor.execute { big.destroy() }
-        executor.shutdown()
+        executor?.execute { big?.destroy() }
+        executor?.shutdown()
         small.destroy()
     }
 

@@ -20,6 +20,80 @@ adb -e shell am start -n com.euhack.hello/.DemoActivity
 
 Replace `igcap` with an AVD shown by `emulator -list-avds`.
 
+## Hand inference performance diagnostics
+
+Normal launches run only the small model with four native threads. The big model, its input buffer, and its
+executor are not created. This avoids background inference blocking tracking and resetting the thread pool.
+The big model remains bundled for optional ADB comparisons. `-S` restarts the process so the native thread
+pool and model state start fresh.
+
+```bash
+adb -d shell am start -S -W -n com.euhack.hello/.DemoActivity \
+  --ez perf_diagnostics true --ez perf_background false --ei perf_threads 4
+adb -d logcat -s HandPerf:I HandDemo:I HandTwoTier:I ExecuTorch:I
+```
+
+`perf_background` defaults to false. `perf_threads=1..8` sets the requested pool size on each loaded module;
+0 or omission uses four threads for the small model (and two for the big model if explicitly enabled).
+`perf_diagnostics` defaults to false. To compare against the previous two-model configuration:
+
+```bash
+adb -d shell am start -S -W -n com.euhack.hello/.DemoActivity \
+  --ez perf_diagnostics true --ez perf_background true
+```
+
+To restore the normal small-only configuration while retaining the detailed logs:
+
+```bash
+adb -d shell am start -S -W -n com.euhack.hello/.DemoActivity --ez perf_diagnostics true
+```
+
+`HandPerf` reports normalisation, input tensor construction, native `forward`, output extraction, and
+background input preparation in microseconds. `callerCpuUs` counts only the calling thread's CPU time,
+not the native worker threads; compare it with wall time and the background-off control, not with total CPU
+usage. `bigBusyAtStart` says whether a background job was outstanding when the frame began. Every 30 frames
+it also logs camera dimensions, analysis and sensor timestamp gaps, active recording/fusion modes, and UI
+queue delay (not display presentation latency). Existing `HandDemo` stage times remain in milliseconds.
+
+Measured before changing the default on the Galaxy A35, 2026-10-03, with the bundled skin models, live 640×480 camera input, and
+recording, dumping and fusion off. Each mode ran for 15 seconds after launch, excluding its first 30
+analysed frames. That diagnostic build loaded both models even when background inference was off; the current
+build skips loading the disabled big model. FPS below is measured from consecutive analysis log timestamps;
+it is not 1000/frame time.
+
+| Configuration | Samples | Median native small call | Median whole analysis | Observed FPS |
+| --- | ---: | ---: | ---: | ---: |
+| Background on, shared pool 2 | 71 | 114.65 ms | 138 ms | 6.47 |
+| Background off, shared pool 2 | 348 | 30.92 ms | 37 ms | 26.49 |
+| Background off, shared pool 4 | 403 | 20.91 ms | 27 ms | 29.99 |
+| Background on, shared pool 4 | 121 | 77.86 ms | 94 ms | 10.25 |
+| Background on, shared pool 2, repeat | 82 | 115.01 ms | 132 ms | 7.55 |
+
+The background model blocks the foreground inference path. In the repeat run, the small call takes 115 ms
+of wall time but only 31.58 ms of caller CPU, versus 30.92 ms wall/30.56 ms caller CPU without background
+inference. Input copying is about 0.6–1.4 ms and output extraction about 0.2 ms. The small model itself
+can sustain 30 FPS with four threads in this test. These short runs do not establish sustained thermal
+performance or accuracy with background checking disabled.
+
+Two native-runtime details explain the behaviour:
+
+- ExecuTorch 1.5.1's Android JNI [resets a process-wide thread pool on module construction](https://github.com/pytorch/executorch/blob/v1.5.1/extension/android/jni/jni_layer.cpp#L320-L339).
+  Loading the big model last changes both models to two threads. The device logs explicitly show resets to
+  four and then two; the requested counts are not independent budgets.
+- Its [Android build enables shared XNNPACK workspace](https://github.com/pytorch/executorch/blob/v1.5.1/tools/cmake/preset/android.cmake#L19),
+  and [delegate execution holds the workspace lock](https://github.com/pytorch/executorch/blob/v1.5.1/backends/xnnpack/runtime/XNNPACKBackend.cpp#L158-L189).
+  Moving the big model to a low-priority Java thread does not give it independent native resources.
+
+The chosen default is small-only tracking with four threads; the big model's presence veto/confirmation is
+disabled. Keeping background checking while fixing the blocking would require isolating its native execution
+resources (for example, a separate Android process), then repeating the handset measurements. Merely
+increasing the shared pool to four threads still gave about 10 FPS in the comparison.
+
+After installing this default, a normal launch with no extras measured **29.94 FPS** over 545 frames after
+discarding the first 30 frames (20-second capture). Median reported small inference, including input tensor
+construction, was 22 ms; whole analysis was 25 ms. Logs confirmed one pool initialisation at four threads,
+no background inference, and no model or crash errors.
+
 ## Run on a USB phone
 
 ```bash

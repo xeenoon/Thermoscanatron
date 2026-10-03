@@ -92,6 +92,9 @@ class DemoActivity : ComponentActivity() {
     private val timing = LongArray(6)         // running per-stage ms (EMA x 16), see [analyze]
     private var timedFrames = 0L
     private var lastFrameMs = 0L
+    private var lastAnalysisNs = 0L
+    private var lastSensorNs = 0L
+    private var perfDiagnostics = false
     private lateinit var logger: NoHandLogger
     private lateinit var thermalView: ThermalView
     private lateinit var thermalInset: ThermalView
@@ -201,10 +204,19 @@ class DemoActivity : ComponentActivity() {
                 .apply { bottomMargin = 200 })
         })
 
+        // Normal launches use only the small model with four threads; ADB can enable background comparisons.
+        perfDiagnostics = intent.getBooleanExtra("perf_diagnostics", false)
+        val perfBackground = intent.getBooleanExtra("perf_background", false)
+        val perfThreads = intent.getIntExtra("perf_threads", 0)
+        require(perfThreads in 0..8) { "perf_threads must be 0 (default) or 1..8" }
         analysisExecutor.execute {
             try {
-                hands = HandTwoTier(assetFilePath(this, SMALL_MODEL_ASSET), assetFilePath(this, MODEL_ASSET), SIZE,
-                    SMALL_SIZE, prevMaskInput = false)
+                hands = HandTwoTier(assetFilePath(this, SMALL_MODEL_ASSET),
+                    if (perfBackground) assetFilePath(this, MODEL_ASSET) else null, SIZE,
+                    SMALL_SIZE, prevMaskInput = false, backgroundEnabled = perfBackground,
+                    smallThreads = if (perfThreads == 0) HandTwoTier.SMALL_THREADS else perfThreads,
+                    bigThreads = if (perfThreads == 0) HandTwoTier.BIG_THREADS else perfThreads,
+                    diagnostics = perfDiagnostics)
                 runOnUiThread { status.text = "Model loaded — hold your hand in the box" }
             } catch (e: Exception) {
                 Log.e(TAG, "model load failed", e)
@@ -323,7 +335,8 @@ class DemoActivity : ComponentActivity() {
         val meta = JSONObject()
             .put("created", stamp)
             .put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
-            .put("model_asset", MODEL_ASSET)
+            .put("model_asset", SMALL_MODEL_ASSET)
+            .put("background_model_asset", if (intent.getBooleanExtra("perf_background", false)) MODEL_ASSET else JSONObject.NULL)
             .put("thermal_sensor", "MLX90640-BAB (Adafruit 4407) 55x35 deg, taped to the back of the phone")
         val info = camera?.cameraInfo ?: return meta
         val c2 = Camera2CameraInfo.from(info)
@@ -804,6 +817,10 @@ class DemoActivity : ComponentActivity() {
         val rotation = image.imageInfo.rotationDegrees
         val sensorTsNs = image.imageInfo.timestamp
         val analysisNs = SystemClock.elapsedRealtimeNanos()
+        val analysisGapNs = if (lastAnalysisNs == 0L) 0L else analysisNs - lastAnalysisNs
+        val sensorGapNs = if (lastSensorNs == 0L) 0L else sensorTsNs - lastSensorNs
+        lastAnalysisNs = analysisNs
+        lastSensorNs = sensorTsNs
         val bufferW = image.width
         val bufferH = image.height
         val sensorToBuffer = FloatArray(9).also { image.imageInfo.sensorToBufferTransformMatrix.getValues(it) }
@@ -824,7 +841,7 @@ class DemoActivity : ComponentActivity() {
         renderCrop(raw, rotation, left, top, side, SMALL_SIZE).getPixels(pixelsSmall, 0, SMALL_SIZE, 0, 0, SMALL_SIZE, SMALL_SIZE)
         val tPrep = SystemClock.elapsedRealtimeNanos()
 
-        // Small model every frame; the big model checks its hand/no-hand call in the background ([HandTwoTier]).
+        // Small model every frame; optional diagnostic background checking is handled by HandTwoTier.
         val result = net.run(pixelsSmall, { crop; pixels }, MEAN, STD)
         val inferMs = result.smallMs
         val maskSmall = result.mask
@@ -863,6 +880,10 @@ class DemoActivity : ComponentActivity() {
             timing[i] = if (timedFrames == 0L) ms * 16 else timing[i] - timing[i] / 16 + ms
         }
         timedFrames++
+        val logFramePerf = perfDiagnostics && timedFrames % 30L == 0L
+        if (logFramePerf) Log.i("HandPerf", "camera buffer=${bufferW}x$bufferH " +
+            "analysisGapUs=${analysisGapNs / 1000} sensorGapUs=${sensorGapNs / 1000} " +
+            "totalUs=${(tEnd - tStart) / 1000} recording=${sessions.active} dump=${logger.enabled} fused=$showFused")
         Log.i(TAG, String.format(Locale.US,
             "timing prep=%d model=%d (small %d, big %d) outline=%d record=%d rest=%d total=%d ms  p=%.2f small=%.2f big=%s",
             stages[0] / 1_000_000, stages[1] / 1_000_000, inferMs, result.bigMs, stages[2] / 1_000_000,
@@ -871,6 +892,7 @@ class DemoActivity : ComponentActivity() {
 
         val logging = if (logger.enabled) "   |   ${logger.dumpCount} dumped" else ""
         runOnUiThread {
+            if (logFramePerf) Log.i("HandPerf", "uiQueueUs=${(SystemClock.elapsedRealtimeNanos() - tEnd) / 1000}")
             updateRecordingLabel()
             if (showFused != fusedVisible) {
                 fusedVisible = showFused
