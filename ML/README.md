@@ -49,6 +49,41 @@ uv run pytest tests/test_thermal_calib.py      # recovers synthetic mountings, e
 The model and both solver stages are documented in `src/segkit/thermal_calib.py`; the phone runs the same
 algorithm (`android-app/.../ThermalCalibration.kt`). The thermal sensor is the 55°×35° MLX90640-BAB.
 
+### Solar panel cells (segment + track which cell is which)
+
+Panel profile (`src/segkit/panel/spec.py`): cell lattice (4 x 9 half-cut mono cells), which row boundaries carry
+the wafer-corner diamonds, gridline width. Pass `--spec profile.json` to the tools for another panel.
+
+Record with the app (Options ▾ → Record), walking from far away (whole panel in view) to close-ups and back, then:
+
+```bash
+S=data/panel/<session>
+adb pull /sdcard/Android/data/com.euhack.hello/files/sessions/<session> data/panel/
+adb pull /sdcard/Android/data/com.euhack.hello/files/videos/hand_<session>.mp4 $S/video.mp4
+mkdir -p $S/frames && ffmpeg -i $S/video.mp4 -q:v 2 $S/frames/%05d.jpg
+# $S/anchors.json: a few far-away frames with 4+ panel points each (diamonds are easiest), see segkit-panel-label -h
+uv run segkit-panel-label $S                 # -> $S/panel_labels.npz + $S/review/sheet_NN.jpg (check them;
+                                             #    add "reject" ranges / more anchors and re-run)
+uv run segkit-panel-train $S --negatives data/panel/negatives.txt --out runs/panel_v1   # -> panelseg.pte
+uv run segkit-panel-track $S --model runs/panel_v1/panelseg.pte --video runs/panel_v1/track.mp4
+uv run segkit-panel-track $S --oracle        # tracker alone, fed the label targets
+# per-cell temperatures + hotspots, thermal pose from segkit.thermal_calib (runs/thermal_calib/thermal_calib.json)
+uv run segkit-panel-thermal $S --calib runs/thermal_calib/thermal_calib.json                   # label geometry
+uv run segkit-panel-thermal $S --calib runs/thermal_calib/thermal_calib.json --source tracker  # live pipeline
+# -> $S/thermal_cells[_tracker].csv: per frame panel average, 36 cell temps, hotspot cells
+#    $S/thermal_summary[_tracker].{json,jpg}: per cell temp + offset from the panel average, hotspot flags
+```
+
+Hotspot = a cell more than 5 °C above or below the panel average (`HOTSPOT_DELTA_C`). Each thermal pixel's
+footprint is cast onto the panel plane (pose from the panel homography and the phone camera's intrinsics); only
+pixels landing wholly inside one cell count for that cell, so frame and background never leak in.
+
+The model predicts, per pixel: cell area, gridlines, and where inside its cell the pixel is
+(sin/cos of u with a one-cell period, of v with a two-row period). It never predicts the cell index: up close
+every cell looks the same. The tracker (`segkit.panel.track`) supplies that from memory: it locks on when
+enough of the panel outline is in view, then carries the integer cell coordinates from frame to frame
+while the model pins the position inside the cell, so the label stays right when zoomed onto a single cell.
+
 ## Dependencies
 
 Python 3.12 (managed by `uv`), PyTorch from `download.pytorch.org/whl/cpu` or `/whl/cu130` (extra `cpu` / `cu130`).

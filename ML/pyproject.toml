@@ -39,6 +39,11 @@ segkit-report = "segkit.report:main"
 segkit-diagnose = "segkit.diagnose:main"
 segkit-test = "segkit.test_set:main"
 segkit-negatives = "segkit.negatives:main"
+segkit-panel-label = "segkit.panel.label:main"
+segkit-panel-train = "segkit.panel.train:main"
+segkit-panel-track = "segkit.panel.track:main"
+segkit-panel-thermal = "segkit.panel.thermal:main"
+segkit-panel-twotier = "segkit.panel.twotier:main"
 
 [tool.uv]
 conflicts = [[{ extra = "cpu" }, { extra = "cu130" }]]

@@ -17,3 +17,5 @@ firmware/sdkconfig.old
 android-app/.gradle/
 android-app/local.properties
 android-app/app/build/
+android-app/solar/build/
+android-app/build/

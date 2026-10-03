@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "EUHack"
 include(":app")
+include(":solar")

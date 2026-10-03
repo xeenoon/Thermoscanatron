@@ -80,3 +80,20 @@ The phone's USB port is then taken, so use wireless debugging (`adb pair` / `adb
 - J. Kopf, M. F. Cohen, D. Lischinski, M. Uyttendaele, "Joint Bilateral Upsampling", *ACM TOG* 26(3) (2007) 96,
   [doi:10.1145/1276377.1276497](https://doi.org/10.1145/1276377.1276497). The same guided-upsampling idea; the guided
   filter is used because it runs in O(pixels).
+
+## Solar Cells app (`solar/`)
+
+A second app (`com.euhack.solar`, launcher "Solar Cells") next to the hand demo. It reuses the hand app's
+thermal USB stream and calibration code as sources from `app/`.
+
+```bash
+./gradlew :solar:assembleDebug :solar:testDebugUnitTest
+adb -d install -r solar/build/outputs/apk/debug/solar-debug.apk
+```
+
+Point it at the panel with a corner in the box to lock on, then move in: it keeps the (row, col) cell numbers.
+A small model (`assets/panelseg_small.pte`, 192 px) runs on every camera frame; the big one (`panelseg.pte`,
+384 px) runs on its own thread and corrects it. Between frames, and through motion blur, the grid follows the
+gyroscope. With the thermal camera plugged in it shows per-cell temperatures and hotspots (more than 5 °C from
+the panel average). **Rec** saves the model input to `files/panel_debug/<time>/` for replay with
+`segkit-panel-track --crops` (see `ML/README.md`). Models come from `segkit-panel-train`.
