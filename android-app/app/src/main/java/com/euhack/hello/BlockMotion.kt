@@ -1,11 +1,11 @@
-package com.euhack.solar
+package com.euhack.hello
 
 import kotlin.math.abs
 
 /**
  * Image translation between consecutive model crops by exhaustive SAD block matching on a 1/4-scale grey copy
- * (port of block_shift in ML/src/segkit/panel/track.py). Up close the model cannot place the grid (inside one
- * cell every spot looks alike), so the tracker coasts on this; the panel's dirt and scratches give it texture.
+ * (port of block_shift in ML/src/segkit/panel/track.py). Shared by both apps: the panel tracker coasts on it up
+ * close (inside one cell every spot looks alike), the hand app carries the big model's late masks forward with it.
  */
 class BlockMotion(private val size: Int, private val scale: Int = SCALE) {
     private val n = size / scale

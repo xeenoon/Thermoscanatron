@@ -47,11 +47,9 @@ import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Module
 import org.json.JSONArray
 import org.json.JSONObject
-import org.pytorch.executorch.Tensor
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -84,9 +82,14 @@ class DemoActivity : ComponentActivity() {
     private lateinit var status: TextView
 
     private val analysisExecutor = Executors.newSingleThreadExecutor()
-    private var module: Module? = null
+    private var hands: HandTwoTier? = null
     private val input = FloatArray(3 * SIZE * SIZE)
     private val pixels = IntArray(SIZE * SIZE)
+    private val pixelsSmall = IntArray(SMALL_SIZE * SMALL_SIZE)
+    private val edgeLabels = IntArray(SMALL_SIZE * SMALL_SIZE)
+    private val edgeQueue = IntArray(SMALL_SIZE * SMALL_SIZE)
+    private val timing = LongArray(6)         // running per-stage ms (EMA x 16), see [analyze]
+    private var timedFrames = 0L
     private var lastFrameMs = 0L
     private lateinit var logger: NoHandLogger
     private lateinit var thermalView: ThermalView
@@ -190,7 +193,8 @@ class DemoActivity : ComponentActivity() {
 
         analysisExecutor.execute {
             try {
-                module = Module.load(assetFilePath(this, MODEL_ASSET))
+                hands = HandTwoTier(assetFilePath(this, SMALL_MODEL_ASSET), assetFilePath(this, MODEL_ASSET), SIZE,
+                    SMALL_SIZE)
                 runOnUiThread { status.text = "Model loaded — hold your hand in the box" }
             } catch (e: Exception) {
                 Log.e(TAG, "model load failed", e)
@@ -473,7 +477,7 @@ class DemoActivity : ComponentActivity() {
      * real hands). Uncalibrated or calibrating: something in the thermal view must be warm at all. Without a
      * live thermal camera, or if the hand is outside the thermal view, the model's answer stands.
      */
-    private fun thermalAgrees(mask: FloatArray, left: Int, top: Int, side: Int, cam: CameraIntrinsics): Boolean {
+    private fun thermalAgrees(mask: FloatArray, n: Int, left: Int, top: Int, side: Int, cam: CameraIntrinsics): Boolean {
         if (!thermalLive()) return true
         val t = latestThermal?.celsius ?: return true
         val cal = calibration
@@ -486,9 +490,9 @@ class DemoActivity : ComponentActivity() {
         val uv = DoubleArray(2)
         val temps = ArrayList<Float>()
         for (gy in 0 until VETO_GRID) for (gx in 0 until VETO_GRID) {
-            val mx = ((gx + 0.5) / VETO_GRID * SIZE).toInt()
-            val my = ((gy + 0.5) / VETO_GRID * SIZE).toInt()
-            if (mask[my * SIZE + mx] <= 0.5f) continue
+            val mx = ((gx + 0.5) / VETO_GRID * n).toInt()
+            val my = ((gy + 0.5) / VETO_GRID * n).toInt()
+            if (mask[my * n + mx] <= 0.5f) continue
             val fx = left + (gx + 0.5) / VETO_GRID * side
             val fy = top + (gy + 0.5) / VETO_GRID * side
             cal.pose.project((fx - cam.cx) / cam.f * z, (fy - cam.cy) / cam.f * z, z, uv)
@@ -625,7 +629,7 @@ class DemoActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        analysisExecutor.execute { module?.destroy() }
+        analysisExecutor.execute { hands?.close() }
         analysisExecutor.shutdown()
     }
 
@@ -637,20 +641,30 @@ class DemoActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    @OptIn(markerClass = [ExperimentalCamera2Interop::class])
+    private fun fixedFrameRate(preview: Preview.Builder, analysis: ImageAnalysis.Builder) {
+        val range = android.util.Range(TARGET_FPS, TARGET_FPS)
+        val key = android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE
+        androidx.camera.camera2.interop.Camera2Interop.Extender(preview).setCaptureRequestOption(key, range)
+        androidx.camera.camera2.interop.Camera2Interop.Extender(analysis).setCaptureRequestOption(key, range)
+    }
+
     private fun bindCamera() {
         val provider = cameraProvider ?: return
         // Same 4:3 stream shape for preview and analysis, so analysis pixels map straight onto the preview.
         val ratio = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
             .build()
-        val preview = Preview.Builder().setResolutionSelector(ratio).build()
-            .also { it.surfaceProvider = previewView.surfaceProvider }
-        val analysis = ImageAnalysis.Builder()
+        val previewB = Preview.Builder().setResolutionSelector(ratio)
+        val analysisB = ImageAnalysis.Builder()
             .setResolutionSelector(ratio)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-            .build()
-            .also { it.setAnalyzer(analysisExecutor, ::analyze) }
+        // The camera's top rate (30 fps on the A35) even in dim light: auto-exposure would otherwise drop to 15 fps,
+        // and shorter exposures also blur a moving hand less.
+        fixedFrameRate(previewB, analysisB)
+        val preview = previewB.build().also { it.surfaceProvider = previewView.surfaceProvider }
+        val analysis = analysisB.build().also { it.setAnalyzer(analysisExecutor, ::analyze) }
         val recorder = Recorder.Builder()
             .setQualitySelector(
                 QualitySelector.from(Quality.FHD, FallbackStrategy.higherQualityOrLowerThan(Quality.FHD))
@@ -672,13 +686,64 @@ class DemoActivity : ComponentActivity() {
         readFocalLength()
     }
 
+    /** The upright frame's centred box, rotated and scaled straight out of the camera buffer in one draw. */
+    private fun renderCrop(raw: Bitmap, rotation: Int, left: Int, top: Int, side: Int, out: Int): Bitmap {
+        val m = Matrix()
+        m.postRotate(rotation.toFloat())
+        when (rotation) {
+            90 -> m.postTranslate(raw.height.toFloat(), 0f)
+            180 -> m.postTranslate(raw.width.toFloat(), raw.height.toFloat())
+            270 -> m.postTranslate(0f, raw.width.toFloat())
+        }
+        m.postTranslate(-left.toFloat(), -top.toFloat())
+        m.postScale(out.toFloat() / side, out.toFloat() / side)
+        val bmp = Bitmap.createBitmap(out, out, Bitmap.Config.ARGB_8888)
+        Canvas(bmp).drawBitmap(raw, m, Paint(Paint.FILTER_BITMAP_FLAG))
+        return bmp
+    }
+
+    /** Small-model mask (SMALL_SIZE^2) -> SIZE^2 for the consumers that work in model pixels, bilinear. */
+    private fun upsample(m: FloatArray): FloatArray {
+        val n = SMALL_SIZE
+        val out = FloatArray(SIZE * SIZE)
+        val r = n.toFloat() / SIZE
+        for (y in 0 until SIZE) {
+            val sy = ((y + 0.5f) * r - 0.5f).coerceIn(0f, n - 1f)
+            val y0 = sy.toInt(); val y1 = minOf(y0 + 1, n - 1); val fy = sy - y0
+            for (x in 0 until SIZE) {
+                val sx = ((x + 0.5f) * r - 0.5f).coerceIn(0f, n - 1f)
+                val x0 = sx.toInt(); val x1 = minOf(x0 + 1, n - 1); val fx = sx - x0
+                val t = m[y0 * n + x0] * (1 - fx) + m[y0 * n + x1] * fx
+                val b = m[y1 * n + x0] * (1 - fx) + m[y1 * n + x1] * fx
+                out[y * SIZE + x] = t * (1 - fy) + b * fy
+            }
+        }
+        return out
+    }
+
+    private fun normaliseBig(): FloatArray {
+        val plane = SIZE * SIZE
+        for (i in 0 until plane) {
+            val p = pixels[i]
+            input[i] = (((p shr 16) and 0xFF) / 255f - MEAN[0]) / STD[0]
+            input[plane + i] = (((p shr 8) and 0xFF) / 255f - MEAN[1]) / STD[1]
+            input[2 * plane + i] = ((p and 0xFF) / 255f - MEAN[2]) / STD[2]
+        }
+        return input
+    }
+
+    /**
+     * Per frame: the small model's crop is drawn straight from the camera buffer; the full upright frame, the
+     * 384 px crop and the 384 px mask are only made when something needs them (big model free, recording,
+     * logging, calibration, fused view). Stage times are logged every frame and averaged in the status line.
+     */
     private fun analyze(image: ImageProxy) {
-        val net = module
+        val net = hands
         if (net == null) {
             image.close()
             return
         }
-        // Upright frame, then the centred square (same box the overlay draws).
+        val tStart = SystemClock.elapsedRealtimeNanos()
         val rotation = image.imageInfo.rotationDegrees
         val sensorTsNs = image.imageInfo.timestamp
         val analysisNs = SystemClock.elapsedRealtimeNanos()
@@ -687,46 +752,65 @@ class DemoActivity : ComponentActivity() {
         val sensorToBuffer = FloatArray(9).also { image.imageInfo.sensorToBufferTransformMatrix.getValues(it) }
         val raw = image.toBitmap()
         image.close()
-        val frame = if (rotation == 0) raw else
-            Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, Matrix().apply { postRotate(rotation.toFloat()) }, true)
-        val side = (minOf(frame.width, frame.height) * BOX_FRACTION).toInt()
-        val left = (frame.width - side) / 2
-        val top = (frame.height - side) / 2
-        val crop = Bitmap.createScaledBitmap(Bitmap.createBitmap(frame, left, top, side, side), SIZE, SIZE, true)
-
-        // RGB -> CHW float, ImageNet-normalised (matches segkit.datasets.hands.normalize).
-        crop.getPixels(pixels, 0, SIZE, 0, 0, SIZE, SIZE)
-        val plane = SIZE * SIZE
-        for (i in 0 until plane) {
-            val p = pixels[i]
-            input[i] = (((p shr 16) and 0xFF) / 255f - MEAN[0]) / STD[0]
-            input[plane + i] = (((p shr 8) and 0xFF) / 255f - MEAN[1]) / STD[1]
-            input[2 * plane + i] = ((p and 0xFF) / 255f - MEAN[2]) / STD[2]
+        val fw = if (rotation % 180 == 0) raw.width else raw.height
+        val fh = if (rotation % 180 == 0) raw.height else raw.width
+        val side = (minOf(fw, fh) * BOX_FRACTION).toInt()
+        val left = (fw - side) / 2
+        val top = (fh - side) / 2
+        val frame by lazy {
+            if (rotation == 0) raw else
+                Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, Matrix().apply { postRotate(rotation.toFloat()) }, true)
         }
+        val crop by lazy {
+            renderCrop(raw, rotation, left, top, side, SIZE).also { it.getPixels(pixels, 0, SIZE, 0, 0, SIZE, SIZE) }
+        }
+        renderCrop(raw, rotation, left, top, side, SMALL_SIZE).getPixels(pixelsSmall, 0, SMALL_SIZE, 0, 0, SMALL_SIZE, SMALL_SIZE)
+        val tPrep = SystemClock.elapsedRealtimeNanos()
 
-        val t0 = SystemClock.elapsedRealtime()
-        val outputs = net.forward(EValue.from(Tensor.fromBlob(input, longArrayOf(1, 3, SIZE.toLong(), SIZE.toLong()))))
-        val inferMs = SystemClock.elapsedRealtime() - t0
-        val mask = outputs[0].toTensor().dataAsFloatArray
-        val present = outputs[1].toTensor().dataAsFloatArray[0]
+        // Small model every frame; the big model checks its hand/no-hand call in the background ([HandTwoTier]).
+        val result = net.run(pixelsSmall, { crop; pixels }, MEAN, STD)
+        val inferMs = result.smallMs
+        val maskSmall = result.mask
+        val mask by lazy { upsample(maskSmall) }
+        val present = result.present
+        val tModel = SystemClock.elapsedRealtimeNanos()
 
         val now = SystemClock.elapsedRealtime()
         val fps = if (lastFrameMs > 0) 1000f / (now - lastFrameMs) else 0f
         lastFrameMs = now
-        val cam = intrinsics(sensorToBuffer, frame.width, frame.height, bufferW)
+        val cam = intrinsics(sensorToBuffer, fw, fh, bufferW)
         val modelHand = present > PRESENT_THRESHOLD
-        val vetoed = modelHand && !thermalAgrees(mask, left, top, side, cam)
+        val vetoed = modelHand && !thermalAgrees(maskSmall, SMALL_SIZE, left, top, side, cam)
         val handVisible = modelHand && !vetoed
-        outlineView.update(frame.width, frame.height, left, top, side, if (handVisible) edgePoints(mask) else null)
-        logger.onFrame(now, crop, input, mask, present, inferMs, handVisible, frame.width, frame.height, rotation)
-        sessions.onCameraFrame(sensorTsNs, analysisNs, frame.width, frame.height, rotation, left, top, side, crop,
-            mask, present, handVisible, inferMs, sensorToBuffer, bufferW, bufferH)
+        outlineView.update(fw, fh, left, top, side, if (handVisible) edgePoints(maskSmall) else null)
+        val tOutline = SystemClock.elapsedRealtimeNanos()
+        if (logger.enabled) {
+            logger.onFrame(now, crop, normaliseBig(), mask, present, inferMs, handVisible, fw, fh, rotation)
+        }
+        if (sessions.active) {
+            sessions.onCameraFrame(sensorTsNs, analysisNs, fw, fh, rotation, left, top, side, crop,
+                mask, present, handVisible, inferMs, sensorToBuffer, bufferW, bufferH)
+        }
+        val tRecord = SystemClock.elapsedRealtimeNanos()
 
         intrinsicsForCalibration = cam
         val state = calibState
         if (state == CalibState.COLLECTING) collectCalibration(sensorTsNs, mask, left, top, side, cam, handVisible, now)
         val showFused = calibration != null && fusedMode && !thermalMode && state == CalibState.OFF && thermalLive()
         if (showFused) renderFused(frame, mask, handVisible, left, top, side, cam)
+        val tEnd = SystemClock.elapsedRealtimeNanos()
+        val stages = longArrayOf(tPrep - tStart, tModel - tPrep, tOutline - tModel, tRecord - tOutline,
+            tEnd - tRecord, tEnd - tStart)
+        for (i in stages.indices) {
+            val ms = stages[i] / 1_000_000
+            timing[i] = if (timedFrames == 0L) ms * 16 else timing[i] - timing[i] / 16 + ms
+        }
+        timedFrames++
+        Log.i(TAG, String.format(Locale.US,
+            "timing prep=%d model=%d (small %d, big %d) outline=%d record=%d rest=%d total=%d ms  p=%.2f small=%.2f big=%s",
+            stages[0] / 1_000_000, stages[1] / 1_000_000, inferMs, result.bigMs, stages[2] / 1_000_000,
+            stages[3] / 1_000_000, stages[4] / 1_000_000, stages[5] / 1_000_000, present, result.smallPresent,
+            result.bigPresent?.let { String.format(Locale.US, "%.2f", it) } ?: "-"))
 
         val logging = if (logger.enabled) "   |   ${logger.dumpCount} dumped" else ""
         runOnUiThread {
@@ -745,25 +829,29 @@ class DemoActivity : ComponentActivity() {
             }
             val fused = if (showFused) "$fusedStatus   |   " else ""
             status.text = String.format(
-                Locale.US, "%s%s  %.2f   |   %d ms   |   %.0f fps%s",
-                fused, if (handVisible) "HAND" else if (vetoed) "NOT WARM" else "NO HAND", present, inferMs, fps, logging,
+                Locale.US, "%s%s  %.2f   |   frame %d ms (prep %d, small %d, big %d bg)   |   %.0f fps%s",
+                fused, if (handVisible) "HAND" else if (vetoed) "NOT WARM" else "NO HAND", present,
+                timing[5] / 16, timing[0] / 16, inferMs, result.bigMs, fps, logging,
             )
             status.setTextColor(if (handVisible) Color.GREEN else Color.WHITE)
         }
     }
 
     /**
-     * Outline of the single largest blob in the mask (prob > 0.5), as (u, v) pairs in model pixels.
-     * The model can mark stray skin-coloured patches as separate blobs; there is only one hand, so
-     * everything but the largest connected region is dropped.
+     * Outline of the single largest blob in the small model's mask (prob > 0.5), as (u, v) pairs in SIZE-model
+     * pixels (the overlay's units). The model can mark stray skin-coloured patches as separate blobs; there is only
+     * one hand, so everything but the largest connected region is dropped. No per-pixel allocation: this runs on
+     * every frame.
      */
     private fun edgePoints(mask: FloatArray): FloatArray {
-        val labels = IntArray(SIZE * SIZE)
-        val queue = IntArray(SIZE * SIZE)
+        val n = SMALL_SIZE
+        val labels = edgeLabels
+        val queue = edgeQueue
+        labels.fill(0)
         var best = 0
         var bestArea = 0
         var next = 0
-        for (start in 0 until SIZE * SIZE) {
+        for (start in 0 until n * n) {
             if (mask[start] <= 0.5f || labels[start] != 0) continue
             next++
             var head = 0
@@ -772,31 +860,34 @@ class DemoActivity : ComponentActivity() {
             labels[start] = next
             while (head < tail) {
                 val i = queue[head++]
-                val u = i % SIZE
-                val v = i / SIZE
-                for (j in intArrayOf(if (u > 0) i - 1 else -1, if (u < SIZE - 1) i + 1 else -1,
-                                     if (v > 0) i - SIZE else -1, if (v < SIZE - 1) i + SIZE else -1)) {
-                    if (j >= 0 && labels[j] == 0 && mask[j] > 0.5f) {
-                        labels[j] = next
-                        queue[tail++] = j
-                    }
-                }
+                val u = i % n
+                val v = i / n
+                if (u > 0 && labels[i - 1] == 0 && mask[i - 1] > 0.5f) { labels[i - 1] = next; queue[tail++] = i - 1 }
+                if (u < n - 1 && labels[i + 1] == 0 && mask[i + 1] > 0.5f) { labels[i + 1] = next; queue[tail++] = i + 1 }
+                if (v > 0 && labels[i - n] == 0 && mask[i - n] > 0.5f) { labels[i - n] = next; queue[tail++] = i - n }
+                if (v < n - 1 && labels[i + n] == 0 && mask[i + n] > 0.5f) { labels[i + n] = next; queue[tail++] = i + n }
             }
             if (tail > bestArea) {
                 bestArea = tail
                 best = next
             }
         }
-        val out = ArrayList<Float>()
-        if (best == 0) return out.toFloatArray()
-        fun inside(u: Int, v: Int) = u in 0 until SIZE && v in 0 until SIZE && labels[v * SIZE + u] == best
-        for (v in 0 until SIZE) for (u in 0 until SIZE) {
+        if (best == 0) return FloatArray(0)
+        fun inside(u: Int, v: Int) = u in 0 until n && v in 0 until n && labels[v * n + u] == best
+        var count = 0
+        for (v in 0 until n) for (u in 0 until n) {
+            if (inside(u, v) && (!inside(u - 1, v) || !inside(u + 1, v) || !inside(u, v - 1) || !inside(u, v + 1))) count++
+        }
+        val out = FloatArray(2 * count)
+        val k = SIZE.toFloat() / n
+        var j = 0
+        for (v in 0 until n) for (u in 0 until n) {
             if (inside(u, v) && (!inside(u - 1, v) || !inside(u + 1, v) || !inside(u, v - 1) || !inside(u, v + 1))) {
-                out.add(u + 0.5f)
-                out.add(v + 0.5f)
+                out[j++] = (u + 0.5f) * k
+                out[j++] = (v + 0.5f) * k
             }
         }
-        return out.toFloatArray()
+        return out
     }
 
     /** Draws the analysis box and the hand outline, mapped from frame pixels onto the FIT_CENTER preview. */
@@ -845,6 +936,9 @@ class DemoActivity : ComponentActivity() {
     companion object {
         private const val TAG = "HandDemo"
         private const val MODEL_ASSET = "handseg.pte"
+        private const val SMALL_MODEL_ASSET = "handseg_small.pte"
+        private const val SMALL_SIZE = 256
+        private const val TARGET_FPS = 30
         private const val SIZE = 384
         private const val BOX_FRACTION = 0.9f
         private const val PRESENT_THRESHOLD = 0.5f

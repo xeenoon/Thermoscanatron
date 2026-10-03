@@ -93,6 +93,9 @@ def main() -> None:
     p.add_argument("--negative-share", type=float, default=0.25,
                    help="share of each training epoch drawn from --negatives")
     p.add_argument("--no-pretrained", action="store_true")
+    p.add_argument("--init", type=Path, help="start from these weights (fine-tune), e.g. the 384 px model's best.pt "
+                                             "for the phone's small fast-path model at --size 192")
+    p.add_argument("--name", default="handseg", help="exported file name (<name>.pte)")
     p.add_argument("--no-export", action="store_true")
     args = p.parse_args()
 
@@ -134,7 +137,9 @@ def main() -> None:
     val_set = ConcatDataset(val_parts)
     val_loader = DataLoader(val_set, batch_size=args.batch, num_workers=args.workers, pin_memory=True)
 
-    model = HandSegNet(pretrained=not args.no_pretrained).to(device)
+    model = HandSegNet(pretrained=not args.no_pretrained and args.init is None).to(device)
+    if args.init:
+        model.load_state_dict(torch.load(args.init, map_location=device))
     print(f"HandSegNet {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params")
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.epochs * len(train_loader),
@@ -188,7 +193,7 @@ def main() -> None:
         model.load_state_dict(torch.load(args.out / "best.pt", map_location="cpu"))
         deploy = ProbabilityHead(model.cpu()).eval()
         x = torch.randn(1, 3, args.size, args.size)
-        pte = export_pte(deploy, x, args.out / "handseg.pte")
+        pte = export_pte(deploy, x, args.out / f"{args.name}.pte")
         with torch.no_grad():
             eager = deploy(x)
         out = PteRunner(pte).method.execute([x])

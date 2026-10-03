@@ -43,6 +43,7 @@ import com.euhack.hello.CameraIntrinsics
 import com.euhack.hello.ThermalCalibration
 import com.euhack.hello.ThermalFrame
 import com.euhack.hello.ThermalUsbStream
+import com.euhack.hello.BlockMotion
 import org.pytorch.executorch.EValue
 import org.pytorch.executorch.Module
 import org.pytorch.executorch.Tensor
@@ -79,7 +80,9 @@ class PanelActivity : ComponentActivity(), SensorEventListener {
     private val pixelsSmall = IntArray(SMALL * SMALL)
     private val inputBig = FloatArray(3 * SIZE * SIZE)
     private val pixelsBig = IntArray(SIZE * SIZE)
-    private val bigExecutor = Executors.newSingleThreadExecutor()
+    private val bigExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread({ android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); r.run() }, "panel-big")
+    }
     private val bigBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     private val bigResults = java.util.concurrent.ConcurrentLinkedQueue<Pair<Long, DoubleArray?>>()
     private val slowTracker by lazy { PanelTracker(spec, SIZE) }
@@ -179,8 +182,9 @@ class PanelActivity : ComponentActivity(), SensorEventListener {
         loadCalibration()
         analysisExecutor.execute {
             try {
-                small = Module.load(assetFilePath(this, SMALL_ASSET))
-                big = Module.load(assetFilePath(this, MODEL_ASSET))
+                // Separate thread budgets so the background model cannot starve the one the camera waits for.
+                small = Module.load(assetFilePath(this, SMALL_ASSET), Module.LOAD_MODE_FILE, SMALL_THREADS)
+                big = Module.load(assetFilePath(this, MODEL_ASSET), Module.LOAD_MODE_FILE, BIG_THREADS)
                 runOnUiThread { status.text = "Point at the panel: whole panel (or a corner) in the box" }
             } catch (e: Exception) {
                 Log.e(TAG, "model load failed", e)
@@ -624,6 +628,8 @@ class PanelActivity : ComponentActivity(), SensorEventListener {
         private const val MODEL_ASSET = "panelseg.pte"
         private const val SMALL_ASSET = "panelseg_small.pte"
         private const val SMALL = 192
+        private const val SMALL_THREADS = 4   // the A35's four big cores
+        private const val BIG_THREADS = 2
         private const val TARGET_FPS = 30
         private const val BLUR_RAD_S = 1.5   // turning faster than ~85 deg/s smears the frame: follow the gyro
         private const val CALIB_ASSET = "thermal_calib.json"
