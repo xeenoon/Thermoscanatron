@@ -1,3 +1,13 @@
-# Over GitHub 100MB limit (SolidWorks simulation results, regenerable)
-/HACKATHON_ASSEMBLY_v4_+Studies-Static 1.CWR
-/HACKATHON_ASSEMBLY (1)-Static 1.CWR
+# SolidWorks simulation results (large, regenerable by re-running the study)
+*.CWR
+*.PCD
+*.PCG
+*.BMC
+*.DF1
+*.DF2
+*.gsz
+*.MFC
+*.SL3
+*.SL4
+*-Static*.LOG
+*-Buckling*.LOG
