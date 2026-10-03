@@ -425,12 +425,13 @@ object ThermalCalibration {
     // ------------------------------------------------------------------------------------------ stage 2
 
     /** Sub-pixel rays (768 x 4 x 3) of [pose] in camera coordinates, pixel-major. */
-    fun rays(pose: ThermalPose): DoubleArray {
-        val rays = DoubleArray(PIXELS * 4 * 3)
+    /** [sub] = 4: 2x2 sub-rays per pixel (its footprint); 1: the pixel centre only (4x cheaper, coarse search). */
+    fun rays(pose: ThermalPose, sub: Int = 4): DoubleArray {
+        val rays = DoubleArray(PIXELS * sub * 3)
         val d = DoubleArray(3)
-        for (v in 0 until ThermalGeometry.H) for (u in 0 until ThermalGeometry.W) for (s in 0 until 4) {
-            pose.ray(u + SUB[2 * s], v + SUB[2 * s + 1], d)
-            val o = ((v * ThermalGeometry.W + u) * 4 + s) * 3
+        for (v in 0 until ThermalGeometry.H) for (u in 0 until ThermalGeometry.W) for (s in 0 until sub) {
+            if (sub == 4) pose.ray(u + SUB[2 * s], v + SUB[2 * s + 1], d) else pose.ray(u.toDouble(), v.toDouble(), d)
+            val o = ((v * ThermalGeometry.W + u) * sub + s) * 3
             rays[o] = d[0]; rays[o + 1] = d[1]; rays[o + 2] = d[2]
         }
         return rays
@@ -441,15 +442,15 @@ object ThermalCalibration {
      * and whether all of the pixel's rays land inside the crop box (into [valid]).
      */
     fun predict(rays: DoubleArray, p: DoubleArray, c: CameraSample, cam: CameraIntrinsics,
-                frac: FloatArray, valid: BooleanArray) {
+                frac: FloatArray, valid: BooleanArray, sub: Int = 4) {
         val raw = FloatArray(PIXELS)
         val z = c.depth
         val m = c.mask
         for (i in 0 until PIXELS) {
             var acc = 0f
             var ok = true
-            for (s in 0 until 4) {
-                val o = (i * 4 + s) * 3
+            for (s in 0 until sub) {
+                val o = (i * sub + s) * 3
                 val scale = (z - p[5]) / rays[o + 2]
                 val px = cam.f * (p[3] + scale * rays[o]) / z + cam.cx
                 val py = cam.f * (p[4] + scale * rays[o + 1]) / z + cam.cy
@@ -468,26 +469,32 @@ object ThermalCalibration {
                 acc += m[b] * (1 - fx) * (1 - fy) + m[b + 1] * fx * (1 - fy) +
                     m[b + MASK_GRID] * (1 - fx) * fy + m[b + MASK_GRID + 1] * fx * fy
             }
-            raw[i] = acc / 4
+            raw[i] = acc / sub
             valid[i] = ok
         }
         gaussianBlur(raw, frac)
     }
 
-    /** Pearson correlation between predicted hand fraction and warmth over pixels whose rays hit the crop. */
-    fun correlation(p: DoubleArray, mirror: Boolean, pairs: List<Pair>, cam: CameraIntrinsics): Double {
-        val rays = rays(ThermalPose.of(p, mirror))
-        val frac = FloatArray(PIXELS)
-        val valid = BooleanArray(PIXELS)
-        var n = 0.0; var sx = 0.0; var sy = 0.0; var sxx = 0.0; var syy = 0.0; var sxy = 0.0
-        for (pair in pairs) {
-            predict(rays, p, pair.cam, cam, frac, valid)
+    /**
+     * Pearson correlation between predicted hand fraction and warmth over pixels whose rays hit the crop.
+     * Frames are independent, so they are spread over all cores and their sums added up.
+     */
+    fun correlation(p: DoubleArray, mirror: Boolean, pairs: List<Pair>, cam: CameraIntrinsics, sub: Int = 4): Double {
+        val rays = rays(ThermalPose.of(p, mirror), sub)
+        val sums = java.util.stream.IntStream.range(0, pairs.size).parallel().mapToObj { k ->
+            val frac = FloatArray(PIXELS)
+            val valid = BooleanArray(PIXELS)
+            val pair = pairs[k]
+            predict(rays, p, pair.cam, cam, frac, valid, sub)
+            val t = DoubleArray(6)
             for (i in 0 until PIXELS) if (valid[i]) {
                 val a = frac[i].toDouble()
                 val b = pair.warm[i].toDouble()
-                n++; sx += a; sy += b; sxx += a * a; syy += b * b; sxy += a * b
+                t[0]++; t[1] += a; t[2] += b; t[3] += a * a; t[4] += b * b; t[5] += a * b
             }
-        }
+            t
+        }.reduce(DoubleArray(6)) { x, y -> DoubleArray(6) { x[it] + y[it] } }
+        val n = sums[0]; val sx = sums[1]; val sy = sums[2]; val sxx = sums[3]; val syy = sums[4]; val sxy = sums[5]
         if (n < 50) return -1.0
         val cov = sxy - sx * sy / n
         val va = sxx - sx * sx / n
@@ -611,14 +618,18 @@ object ThermalCalibration {
         val near = nearDepth(pairs)
         val p1 = doubleArrayOf(x1[0], x1[1], wrapAngle(x1[2]), x1[3], x1[4], x1[5], 0.0)
 
-        // Stage 2: maximise silhouette correlation.
+        // Stage 2: maximise silhouette correlation. Coarse search with one ray per thermal pixel (4x cheaper),
+        // then a short polish with the full 2x2 footprint. Stopping at 1e-3 (0.06 deg, 0.001 cm, 0.1% scale)
+        // is still far finer than the data resolves (~0.5 deg).
         var evals = 0
         val step = doubleArrayOf(Math.toRadians(3.0), Math.toRadians(3.0), Math.toRadians(3.0), 2.0, 2.0, 2.0, 0.1)
-        val p = nelderMead({ q ->
+        fun objective(sub: Int) = { q: DoubleArray ->
             evals++
-            if (evals % 25 == 0) progress(min(0.95, 0.4 + 0.55 * evals / (maxIter * 1.5)))
-            if (plausible(q, near)) -correlation(q, mirror, fitSet, cam) + prior(q) else 1.0
-        }, p1, step, maxIter)
+            if (evals % 25 == 0) progress(min(0.95, 0.4 + 0.55 * evals / (maxIter * 0.8)))
+            if (plausible(q, near)) -correlation(q, mirror, fitSet, cam, sub) + prior(q) else 1.0
+        }
+        val coarse = nelderMead(objective(1), p1, step, maxIter, xatol = 1e-3, fatol = 1e-4)
+        val p = nelderMead(objective(4), coarse, DoubleArray(7) { step[it] / 3 }, maxIter / 4, xatol = 1e-3, fatol = 1e-4)
         val sigma = sensitivity(p, mirror, fitSet, cam)
         progress(1.0)
         canonicalize(p)
