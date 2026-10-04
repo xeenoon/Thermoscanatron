@@ -1,31 +1,74 @@
 # EU-hack
 
-## Browser webcam demo
+## Device components
 
-A Python Gradio/FastRTC server runs the solar-panel tracker and hand-segmentation models while a laptop or phone browser streams the camera.
+- MLX90640: $32\times24$ thermal pixels.
+- ESP32-S3: factory-calibrated temperature conversion and USB streaming.
+- Android app: local ExecuTorch inference, tracking and temperature overlays; the phone also powers the sensor.
+- SolidWorks housing: a 3D-printable phone attachment. The revised 100 N simulation gave 1.25 MPa maximum stress and 0.0149 mm displacement.
 
-```sh
-cd ML
-uv sync --extra cpu --extra web
-uv run --extra cpu --extra web segkit-panel-web
-```
+## Scanner mapping: hand recognition and calibration
 
-Open <http://127.0.0.1:7860>. See [ML/README.md](ML/README.md#browser-webcam-demo) for model overrides.
+HandSegNet uses a MobileNetV3-Small encoder with a U-Net-style decoder and presence head, approximately 1.70 million parameters, at $256\times256$ input resolution. The deployed model's final run used 5,288 training frames, 1,356 validation frames and 2,000 additional negative images: 30 epochs in 0.239 hours.
 
-## 3D housing & structural studies
+Our offline labeller combines SegFormer-B2 human parsing with BiRefNet foreground masks and MediaPipe hand landmarks. Landmark-guided cropping removes sleeves; clothing predictions veto false skin regions. These automatically generated masks transfer heavier models' predictions into the compact phone model through supervised pseudo-label training.
 
-CAD, STL and print files for the phone + thermal camera housing are in [3d/](3d/). The raw SolidWorks simulation output files are gitignored because they're large and can be regenerated.
+The hand estimates the **relative camera pose**. Approximating an open hand as a front-facing plane of area $A_h=130\,\mathrm{cm}^2$, its mask area $a$ gives depth:
 
-We ran two SolidWorks static studies. Each one applies 100 N to opposite sides of the casing, which simulates someone forcing the sliding attachment open or shut.
+$$
+Z=f\sqrt{A_h/a},\qquad
+P=ZK^{-1}[u,v,1]^T.
+$$
 
-| Study | Fixed points | Max stress (von Mises) | Max displacement | Max strain |
-|---|---|---|---|---|
-| 1 | Large section of the phone attachment | 13.18 MPa | 0.0486 mm | 0.206% |
-| 2 | Only the phone-gripping hooks (more realistic), with revised CAD | **1.25 MPa** | **0.0149 mm** | **0.026%** |
+Here $f$ is focal length in pixels, $K$ is the RGB intrinsic matrix and $(u,v)$ is the hand centroid. For thermal-camera centre $c$ and rotation $R$:
 
-Study 2 is the more realistic support case and uses the revised design. Compared with study 1 it shows **~90% less stress, ~69% less displacement and ~87% less strain**, which means the revised housing is much stiffer and spreads the load better.
+$$
+P_T=R^T(P-c),\qquad
+R=R_y(\psi)R_x(\theta)R_z(\phi).
+$$
 
-What the numbers mean:
-- **Von Mises stress**: how close the material is to yielding (permanently bending or breaking).
-- **Displacement**: how far the structure moves under the load.
-- **Strain**: how much the material stretches or squashes locally.
+We fit yaw $\psi$, pitch $\theta$ and roll $\phi$, plus translation, by robust least-squares matching projected hand centroids to thermal warm-blob centroids. The thermal lens uses an equidistant projection: image radius is proportional to ray angle. We then refine pose and lens scale by maximising correlation between projected hand coverage and thermal warmth. Near/far hand motion provides parallax; timestamp alignment compensates sensor delay.
+
+## Solar scanning: recognition, geometry and temperature
+
+PanelNet uses a MobileNetV3-Small encoder and U-Net-style decoder, approximately 1.69 million parameters. The phone uses 192-pixel inputs for fast inference and a 384-pixel recovery model. Outputs include cell masks, gridlines, presence and periodic cell coordinates:
+
+$$
+(\sin 2\pi u,\cos 2\pi u,\sin\pi v,\cos\pi v).
+$$
+
+Column phase repeats every cell; row phase repeats every two rows to encode the panel's alternating diamond pattern. Temporal tracking and gyroscope motion preserve integer cell identities through close-ups.
+
+Our offline labeller combines KLT optical flow, SIFT rematching, gridline/diamond constraints and forward/backward tracking. A hidden Markov model with Viterbi decoding resolves cell numbering across the recording. Its homographies generate dense training targets for the phone network: geometric pseudo-labelling, rather than direct neural teacher/student distillation.
+
+A documented training stage used 8,695 panel frames plus 1,291 negatives. Subsequent demo-specific fine-tuning ended with eight epochs taking 0.019 hours; this excludes earlier training and labelling.
+
+Across 3–4 October, 74 completed panel-labelling runs logged 4 h 33 min 33 s cumulatively; interrupted/unlogged runs and hand labelling are additional.
+
+The panel-to-image homography gives its plane pose:
+
+$$
+H\sim K[w r_1,\;h r_2,\;t],\qquad n=r_1\times r_2,
+$$
+
+where $w,h$ are cell dimensions, $r_1,r_2$ are panel axes and $t$ is its origin. A calibrated thermal ray $d$ intersects that plane at:
+
+$$
+X=c+\frac{n^T(t-c)}{n^Td}d.
+$$
+
+Projecting $X-t$ onto the panel axes identifies the cell. Nine rays sample each thermal pixel's footprint; a cell reading accepts only pixels whose entire sampled footprint lies within that cell, excluding boundaries and background.
+
+For accepted thermal pixels $S_i$ in cell $i$ and panel pixels $S_P$:
+
+$$
+T_i=\operatorname{median}_{p\in S_i}T_p,\qquad
+\bar T_P=\frac{1}{|S_P|}\sum_{p\in S_P}T_p,\qquad
+\Delta T_i=T_i-\bar T_P.
+$$
+
+We define a **hotspot** as $\Delta T_i>5^\circ\mathrm C$. The implementation flags $|\Delta T_i|>5^\circ\mathrm C$, including cold anomalies. This is our prototype threshold. Readings are apparent surface temperatures with emissivity set to 0.95.
+
+## Demo result
+
+The suspect panel measured 19 V, 4 V below its 23 V baseline; the healthy panel measured 23.7 V, 0.7 V above baseline. Together with the observed hotspots, the voltage deficit supports identifying the demo panel as faulty.
