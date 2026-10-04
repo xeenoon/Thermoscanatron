@@ -1,18 +1,49 @@
-# Thermal stream test viewer
+# Thermal stream viewer
 
-Displays the calibrated 32×24 MLX90640 temperatures (°C) streamed by the QT Py firmware. A minimal C reader owns the serial device; Node only serves the image.
+A browser viewer for calibrated **32 × 24 MLX90640 temperatures** streamed by the [QT Py firmware](../firmware/README.md). A native C reader handles the serial device; the Node.js server parses packets and sends temperature frames to the browser.
 
-```sh
+## Requirements
+
+- Node.js 20 or later and npm.
+- CMake and a C compiler for the hardware serial reader.
+- A QT Py running the firmware for live measurements.
+
+The simulator runs without the sensor or native reader.
+
+## Try the simulator
+
+From the repository root:
+
+```bash
+cd test_thermal_stream
 npm install
 npm run simulate
 ```
 
-Open <http://localhost:3000>. The simulator validates the full binary parsing and rendering path without hardware.
+Open <http://localhost:3000>. Simulated THM2 packets exercise the JavaScript parser and browser display without hardware.
 
-With the board connected at `/dev/ttyACM0`:
+## Read the sensor
 
-```sh
+Connect the board over USB, list the serial ports, and start the viewer:
+
+```bash
+npm run list-ports
 npm start
 ```
 
-Use `npm test` for parser tests and `npm run validate` for a fragmented, noisy simulated-stream check.
+The default device is `/dev/ttyACM0`. `npm start` builds the native reader automatically. To choose another device or HTTP port:
+
+```bash
+npm start -- --serial /dev/ttyACM1 --http-port 3001
+```
+
+The HTTP port also accepts the `PORT` environment variable. Ensure your user has access to the selected serial device.
+
+## Validation
+
+```bash
+npm test
+npm run validate
+```
+
+The tests cover packet parsing. The validation script feeds a fragmented, noisy simulated stream through the parser. See the [firmware packet specification](../firmware/README.md#usb-packet-format) for field definitions.

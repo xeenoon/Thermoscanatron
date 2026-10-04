@@ -1,123 +1,124 @@
-# ML Run instructions
+# Machine learning and calibration
+
+Python tools for dataset labelling, model training, camera calibration and solar-cell tracking. Models can run in the browser demo or be exported to the [Android apps](../android-app/README.md) with ExecuTorch.
+
+## Setup
+
+Run the examples below from this directory. Use Python 3.12 and `uv`; video extraction also requires `ffmpeg`.
 
 ```bash
 cd ML
-uv sync --extra cpu          # laptop (CPU torch); GPU box: uv sync --extra cu130
-# always pass the same --extra to `uv run`; plain `uv run` installs the CUDA build
-uv run segkit-hello-world   # imports every dependency, runs one small op each; ends with "HELLO WORLD OK"
-uv run pytest               # unit tests
+uv sync --extra cpu
+uv run --extra cpu segkit-hello-world
+uv run --extra cpu pytest
 ```
 
-### Browser webcam demo
+For an NVIDIA GPU, replace `--extra cpu` with `--extra cu130` in both setup and run commands. Keep the same extra on every `uv run` invocation so dependency resolution retains the intended PyTorch and ONNX Runtime builds.
 
-The Gradio/FastRTC demo runs the existing Python models on a server while a laptop or phone browser supplies the
-camera over WebRTC. Its selector switches between the stateful solar-panel cell tracker and HandSeg v3's live hand
-mask. It prefers training checkpoints and otherwise uses the models bundled in the Android apps; override those
-with `--model` / `SEGKIT_PANEL_MODEL` and `--hand-model` / `SEGKIT_HAND_MODEL`.
+Dependencies and command entry points are defined in [pyproject.toml](pyproject.toml).
+
+## Browser webcam demo
+
+The Gradio/FastRTC server processes camera frames supplied by a laptop or phone browser over WebRTC. Select either the stateful solar-cell tracker or the hand-segmentation model.
 
 ```bash
-cd ML
 uv sync --extra cpu --extra web
 uv run --extra cpu --extra web segkit-panel-web
-# Open http://127.0.0.1:7860
 ```
 
-For a remote Hugging Face Space, add an `HF_TOKEN` Space secret so FastRTC can obtain TURN credentials. Camera
-frames are processed in memory and are not recorded by the demo.
+Open <http://127.0.0.1:7860>. The demo prefers training checkpoints and falls back to models bundled with the Android apps. Override the models with `--model` / `SEGKIT_PANEL_MODEL` and `--hand-model` / `SEGKIT_HAND_MODEL`.
 
-### Hand dataset (phone video -> frames -> rembg labels)
+For a Hugging Face Space, configure an `HF_TOKEN` Space secret for FastRTC's TURN credentials. The demo processes frames in memory without recording them.
 
-Record with the Android app (`android-app/`, Options ▾ → Record video: silent 1080p video), then:
+## Hand dataset
+
+Record a video in the hand app using **Options → Record camera + thermal**, then copy the videos from the phone:
 
 ```bash
-adb pull /sdcard/Android/data/com.euhack.hello/files/videos data/      # -> data/videos/*.mp4
-uv run segkit-extract data/videos --out data/captures --fps 3          # sharpest frame per 1/3 s window
-uv run segkit-label data/captures --out data/hands_v1                  # resumable; --limit 5 to try first
-uv run segkit-validate data/hands_v1                                   # checks + review/sheet_NN.jpg
-# data/hands_v1/{images,masks,overlays}/ + index.csv (flags: area, extra_blobs, blurry)
-# data/hands_v1/exclude.txt: stems rejected in manual review (skipped by training)
-# --model isnet-general-use is ~10x faster on CPU, birefnet-general-lite (default) has better edges
+adb pull /sdcard/Android/data/com.euhack.hello/files/videos data/
+uv run --extra cpu segkit-extract data/videos --out data/captures --fps 3
+uv run --extra cpu segkit-label data/captures --out data/hands_v1
+uv run --extra cpu segkit-validate data/hands_v1
 ```
 
-### Eval set (hand outlines)
+Frame extraction selects the sharpest image in each one-third-second window. Labelling is resumable; use `--limit 5` for a small trial. The default foreground model is `birefnet-general-lite`; `--model isnet-general-use` selects an alternative.
 
-Put full-res frames in `data/eval/`, then label them with polygons in LabelMe:
-`hand` = outline cut straight across the wrist, `hole` = background enclosed by the hand,
-`ignore` = a band over the wrist cut (not scored). Zoom in and place vertices on the edge.
+The dataset contains `images/`, `masks/`, `overlays/` and `index.csv`. Inspect the review sheets and list rejected frame stems in `exclude.txt` before training. The separate [skin labeller](src/segkit/label_skin.py) combines human parsing and hand outlines for skin-model datasets.
+
+## Hand evaluation
+
+Place full-resolution frames in `data/eval/` and annotate them with LabelMe:
+
+- **hand:** the hand outline, cut across the wrist.
+- **hole:** background enclosed by the hand.
+- **ignore:** the wrist-cut band, excluded from scoring.
 
 ```bash
 uvx --python 3.12 labelme data/eval --output data/eval --labels hand,hole,ignore
-uv run segkit-eval check data/eval                      # overlays in runs/eval_check/ to verify labels
-uv run segkit-eval score data/eval <pred_dir> --csv runs/scores.csv
-# <pred_dir>/<image stem>.png, full-res, nonzero = hand. Target: p95 boundary error <= 2px
+uv run --extra cpu segkit-eval check data/eval
+uv run --extra cpu segkit-eval score data/eval runs/predictions --csv runs/scores.csv
 ```
 
-### Thermal ↔ camera calibration
+Replace `runs/predictions` with the prediction directory. Each prediction must be a full-resolution PNG named after its source image, with nonzero pixels marking the hand. Check the overlays in `runs/eval_check/` before scoring. The evaluation target is a 95th-percentile boundary error of at most two pixels; this is a target, not a reported result.
 
-Record with the app (Options ▾ → Record camera + thermal), pull `files/sessions/<time>/` into
-`data/thermal_sessions/`, then:
+## Thermal-camera calibration
+
+Record **Options → Record camera + thermal**, then copy the matching `files/sessions/SESSION_ID/` directory into `data/thermal_sessions/`. Replace `SESSION_ID` in the example:
 
 ```bash
-uv run python -m segkit.thermal_calib data/thermal_sessions/<time> --t-ranges 0-55,60-70   # seconds to use
-# -> runs/thermal_calib/thermal_calib.json (pose, lens scale, latency, 1σ) + check.jpg (predicted hand on thermal)
-uv run pytest tests/test_thermal_calib.py      # recovers synthetic mountings, e.g. 30° yaw + 45° roll + 20 cm
+uv run --extra cpu python -m segkit.thermal_calib data/thermal_sessions/SESSION_ID --t-ranges 0-55,60-70
+uv run --extra cpu pytest tests/test_thermal_calib.py
 ```
 
-The model and both solver stages are documented in `src/segkit/thermal_calib.py`; the phone runs the same
-algorithm (`android-app/.../ThermalCalibration.kt`). The thermal sensor is the 55°×35° MLX90640-BAB.
+The time ranges select usable seconds from the recording. Results are written to `runs/thermal_calib/thermal_calib.json` and `check.jpg`, including camera pose, lens scale, latency, uncertainty estimates and a projected-hand preview.
 
-### Solar panel cells (segment + track which cell is which)
+The [Python implementation](src/segkit/thermal_calib.py) documents the model and solver. The phone uses the corresponding [Kotlin implementation](../android-app/app/src/main/java/com/euhack/hello/ThermalCalibration.kt). Move the hand nearer and farther during capture so parallax can distinguish camera offset from rotation.
 
-Panel profile (`src/segkit/panel/spec.py`): cell lattice (4 x 9 half-cut mono cells), which row boundaries carry
-the wafer-corner diamonds, gridline width. Pass `--spec profile.json` to the tools for another panel.
+## Solar-cell labelling and training
 
-Record with the app (Options ▾ → Record), walking from far away (whole panel in view) to close-ups and back, then:
+The default [panel profile](src/segkit/panel/spec.py) describes four columns and nine rows of half-cut cells, including the alternating diamond pattern and gridline width. The labeller accepts `--spec profile.json` for another layout; verify its labels and physical dimensions before using that profile for temperature mapping.
+
+Capture a panel recording with the hand app, moving from a full-panel view into close-ups and back. Set `panel_session_id` to the recording's timestamp:
 
 ```bash
-S=data/panel/<session>
-adb pull /sdcard/Android/data/com.euhack.hello/files/sessions/<session> data/panel/
-adb pull /sdcard/Android/data/com.euhack.hello/files/videos/hand_<session>.mp4 $S/video.mp4
-mkdir -p $S/frames && ffmpeg -i $S/video.mp4 -q:v 2 $S/frames/%05d.jpg
-# $S/anchors.json: a few far-away frames with 4+ panel points each (diamonds are easiest), see segkit-panel-label -h
-uv run segkit-panel-label $S                 # -> $S/panel_labels.npz + $S/review/sheet_NN.jpg (check them;
-                                             #    add "reject" ranges / more anchors and re-run)
-uv run segkit-panel-train $S --negatives data/panel/negatives.txt --out runs/panel_v1   # -> panelseg.pte
-uv run segkit-panel-track $S --model runs/panel_v1/panelseg.pte --video runs/panel_v1/track.mp4
-uv run segkit-panel-track $S --oracle        # tracker alone, fed the label targets
-# per-cell temperatures + hotspots, thermal pose from segkit.thermal_calib (runs/thermal_calib/thermal_calib.json)
-uv run segkit-panel-thermal $S --calib runs/thermal_calib/thermal_calib.json                   # label geometry
-uv run segkit-panel-thermal $S --calib runs/thermal_calib/thermal_calib.json --source tracker  # live pipeline
-# -> $S/thermal_cells[_tracker].csv: per frame panel average, 36 cell temps, hotspot cells
-#    $S/thermal_summary[_tracker].{json,jpg}: per cell temp + offset from the panel average, hotspot flags
+panel_session_id=SESSION_ID
+panel_session="data/panel/$panel_session_id"
+adb pull "/sdcard/Android/data/com.euhack.hello/files/sessions/$panel_session_id" data/panel/
+adb pull "/sdcard/Android/data/com.euhack.hello/files/videos/hand_$panel_session_id.mp4" "$panel_session/video.mp4"
+mkdir -p "$panel_session/frames"
+ffmpeg -i "$panel_session/video.mp4" -q:v 2 "$panel_session/frames/%05d.jpg"
 ```
 
-Hotspot = a cell more than 5 °C above or below the panel average (`HOTSPOT_DELTA_C`). Each thermal pixel's
-footprint is cast onto the panel plane (pose from the panel homography and the phone camera's intrinsics); only
-pixels landing wholly inside one cell count for that cell, so frame and background never leak in.
+Create `anchors.json` in the session directory with at least four panel correspondences for selected wide views. Diamond intersections are useful landmarks; see `segkit-panel-label --help` for the format.
 
-The model predicts, per pixel: cell area, gridlines, and where inside its cell the pixel is
-(sin/cos of u with a one-cell period, of v with a two-row period). It never predicts the cell index: up close
-every cell looks the same. The tracker (`segkit.panel.track`) supplies that from memory: it locks on when
-enough of the panel outline is in view, then carries the integer cell coordinates from frame to frame
-while the model pins the position inside the cell, so the label stays right when zoomed onto a single cell.
+```bash
+uv run --extra cpu segkit-panel-label "$panel_session"
+uv run --extra cpu segkit-panel-train "$panel_session" --negatives data/panel/negatives.txt --out runs/panel_v1
+uv run --extra cpu segkit-panel-track "$panel_session" --model runs/panel_v1/panelseg.pte --video runs/panel_v1/track.mp4
+uv run --extra cpu segkit-panel-track "$panel_session" --oracle
+```
 
-## Dependencies
+Review `panel_labels.npz` and `review/sheet_NN.jpg` before training. Correct anchors or add rejected intervals, then rerun the labeller. The negative-image list must contain suitable panel-free examples. Oracle mode evaluates the tracker using label targets instead of model predictions.
 
-Python 3.12 (managed by `uv`), PyTorch from `download.pytorch.org/whl/cpu` or `/whl/cu130` (extra `cpu` / `cu130`).
+PanelNet predicts cell area, gridlines and periodic within-cell coordinates. The tracker maintains integer row and column identities over time; a close-up of a repeating cell pattern cannot establish its identity by appearance alone.
 
-- torch, torchvision
-- timm
-- segmentation-models-pytorch
-- albumentations
-- executorch
-- mediapipe
-- opencv-python, numpy, pillow
-- tensorboard, tqdm, pyyaml, matplotlib
-- rembg[cpu] (background removal labels)
-- jupyter, pytest (dev)
-- labelme (run via `uvx`, not installed in the env)
+## Per-cell temperatures
+
+Use the saved calibration with either labelled geometry or tracker output:
+
+```bash
+uv run --extra cpu segkit-panel-thermal "$panel_session" --calib runs/thermal_calib/thermal_calib.json
+uv run --extra cpu segkit-panel-thermal "$panel_session" --calib runs/thermal_calib/thermal_calib.json --source tracker
+```
+
+Outputs include `thermal_cells[_tracker].csv` and `thermal_summary[_tracker].json` / `.jpg`: cell temperatures, differences from the panel mean and anomaly flags.
+
+A hotspot is more than 5 °C above the panel mean. The implementation flags differences greater than 5 °C in either direction, so its flags also include cold anomalies. Thermal-pixel footprints are projected onto the panel plane; only footprints entirely within one cell contribute to that cell's reading. This reduces contamination from boundaries and background.
+
+The [Solar Cells app](../android-app/README.md#solar-cells-app) also records analysis crops for `segkit-panel-track --crops` replay.
 
 ## References
+
 
 - F. Hong, J. Song, H. Meng, R. Wang, F. Fang, G. Zhang, "A novel framework on intelligent detection for module
   defects of PV plant combining the visible and infrared images", *Solar Energy* 236 (2022) 406–416,
