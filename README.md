@@ -1,4 +1,4 @@
-# EU-hack
+# Thermoscanatron
 
 ## Device components
 
